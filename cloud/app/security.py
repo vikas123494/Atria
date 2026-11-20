@@ -41,10 +41,14 @@ async def authenticate_collector(request: Request, body: bytes) -> tuple[Collect
     if not all((collector_id, timestamp, nonce, signature)):
         raise HTTPException(401, detail={"code": "BAD_SIGNATURE"})
 
-    if len(nonce) < 20 or len(nonce) > 128:
+    if len(nonce) != 32 or any(ch not in "0123456789abcdefABCDEF" for ch in nonce):
         raise HTTPException(401, detail={"code": "BAD_SIGNATURE"})
     try:
-        stamp = int(timestamp)
+        try:
+            stamp = int(timestamp)
+        except ValueError:
+            from datetime import datetime
+            stamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
     except (TypeError, ValueError):
         raise HTTPException(401, detail={"code": "STALE_TIMESTAMP"})
     if abs(time.time() - stamp) > 300:
