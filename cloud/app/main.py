@@ -5,7 +5,7 @@ import asyncpg
 from fastapi import FastAPI, HTTPException, Request
 from redis.asyncio import Redis
 
-from cloud.app.crypto import SecretBox
+from cloud.app.crypto import ReceiptSigner, SecretBox\nfrom cloud.app.control import router as control_router
 from cloud.app.ingest import router as ingest_router
 from cloud.app.settings import Settings
 
@@ -14,7 +14,7 @@ from cloud.app.settings import Settings
 async def lifespan(app: FastAPI):
     settings = Settings()
     app.state.settings = settings
-    app.state.secret_box = SecretBox.from_environment()
+    app.state.secret_box = SecretBox.from_environment()\n    app.state.receipt_signer = ReceiptSigner.from_environment()
     app.state.db_pool = await asyncpg.create_pool(
         settings.database_url, min_size=1,
         max_size=settings.database_pool_max, command_timeout=5,
@@ -35,7 +35,7 @@ app = FastAPI(
     description="Metadata-only, multi-tenant regional cloud services.",
     lifespan=lifespan,
 )
-app.include_router(ingest_router)
+app.include_router(ingest_router)\napp.include_router(control_router)
 
 
 @app.get("/health/live", tags=["health"])
