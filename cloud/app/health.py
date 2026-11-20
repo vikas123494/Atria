@@ -9,6 +9,17 @@ from datetime import datetime, timezone
 
 STATES = ("Excellent", "Good", "Fair", "Poor")
 
+# Section 19 default bands. Tenant-specific rows in thresholds override these.
+DEFAULT_THRESHOLDS = {
+    "cpu.util_pct": (60.0, 75.0, 90.0),
+    "mem.util_pct": (70.0, 80.0, 92.0),
+    "memory.util_pct": (70.0, 80.0, 92.0),
+    "disk.util_pct": (70.0, 85.0, 95.0),
+    "net.loss_pct": (0.5, 2.0, 5.0),
+    "network.packet_loss_pct": (0.5, 2.0, 5.0),
+    "security.risk_score": (20.0, 50.0, 80.0),
+}
+
 
 def heartbeat_state(last_seen: datetime | None, now: datetime | None = None) -> tuple[str, list[str]]:
     now = now or datetime.now(timezone.utc)
@@ -131,6 +142,8 @@ async def evaluate_collector_health(pool, tenant_id: str, collector_id: str,
                 for metric, samples in by_metric.items():
                     thresholds = samples[0]
                     good, fair, poor = thresholds["good"], thresholds["fair"], thresholds["poor"]
+                    if good is None and fair is None and poor is None:
+                        good, fair, poor = DEFAULT_THRESHOLDS.get(metric, (None, None, None))
                     hysteresis = float(thresholds["hysteresis"] if thresholds["hysteresis"] is not None else 0.10)
                     if good is None and fair is None and poor is None:
                         continue
