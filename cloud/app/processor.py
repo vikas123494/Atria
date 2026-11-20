@@ -221,6 +221,8 @@ async def stream_outbox_publisher(redis, pool, stream: str, interval_seconds: fl
     """Publish committed ingest outbox rows to Redis Streams, safely retrying failures."""
     while stop_event is None or not stop_event.is_set():
         published = False
+        row = None
+        tenant_id = None
         try:
             async with pool.acquire() as conn:
                 tenants = await conn.fetch("SELECT tenant_id FROM tenants ORDER BY tenant_id")
