@@ -38,3 +38,9 @@ Enrollment, Ed25519 receipt signing, durable stream publishing/outbox recovery,
 dashboard JWT/RBAC, health processing, reconciliation, EU deployment and Judge Mode
 remain subsequent implementation milestones. Do not represent them as implemented
 until their code and tests are merged.
+
+Dashboard APIs require a JWT signed with HS256 using the configured
+`DASHBOARD_JWT_SECRET`, issuer `veilops-control`, audience
+`veilops-dashboard`, and claims `sub`, `tenant_id`, and `exp`.
+The control-plane identity provider must issue these tokens; this service
+validates them and does not implement user login or token issuance.
