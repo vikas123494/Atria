@@ -52,6 +52,6 @@ async def enroll(payload: EnrollRequest, request: Request):
         "collector_secret": collector_secret,
         "tenant_id": token["tenant_id"],
         "region": token["region"],
-        "ingest_url": f"https://{token['region']}.ingest/v1",
+        "ingest_url": request.app.state.settings.ingest_base_url,
         "saas_pubkey": request.app.state.receipt_signer.public_key_b64(),
     }
