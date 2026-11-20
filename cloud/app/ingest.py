@@ -3,7 +3,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response\nfrom fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from cloud.app.contracts import Envelope
@@ -68,7 +68,10 @@ async def ingest(request: Request):
                     "status": "duplicate", "received_at": existing["received_at"].isoformat(),
                     "highest_contiguous_seq": await _highest_contiguous(conn, envelope.tenant_id, auth.collector_id),
                 }
-                return receipt
+                receipt["sig"] = request.app.state.receipt_signer.sign(
+                    json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+                )
+                return JSONResponse(status_code=200, content=receipt)
 
             try:
                 await conn.execute(
@@ -106,7 +109,10 @@ async def ingest(request: Request):
         "status": "stored", "received_at": now.isoformat(),
         "highest_contiguous_seq": envelope.seq,
     }
-    return receipt
+    receipt["sig"] = request.app.state.receipt_signer.sign(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+    )
+    return JSONResponse(status_code=202, content=receipt)
 
 
 async def _highest_contiguous(conn, tenant_id: str, collector_id: str) -> int:
