@@ -88,6 +88,21 @@ async def ingest(request: Request):
                     raise HTTPException(409, detail={"code": "SEQUENCE_CONFLICT"}) from exc
                 raise
 
+            event_times = [
+                datetime.fromisoformat(record["event_ts"].replace("Z", "+00:00"))
+                for record in envelope.records if record.get("event_ts")
+            ]
+            if event_times:
+                oldest_event = min(event_times)
+                ingest_delay_ms = max(0, int((now - oldest_event).total_seconds() * 1000))
+                await conn.execute(
+                    """INSERT INTO slo_samples
+                       (tenant_id,kind,sample_key,event_ts,observed_ts,delay_ms)
+                       VALUES($1,'collection_to_ingest',$2,$3,$4,$5)
+                       ON CONFLICT DO NOTHING""",
+                    envelope.tenant_id, str(envelope.payload_id), oldest_event, now, ingest_delay_ms,
+                )
+
             stream_message = {
                 "tenant_id": envelope.tenant_id,
                 "collector_id": auth.collector_id,
