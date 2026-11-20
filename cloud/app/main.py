@@ -68,7 +68,8 @@ app.include_router(ingest_router)
 app.include_router(control_router)
 app.include_router(reconciliation_router)
 app.include_router(dashboard_router)
-app.include_router(events_router)\napp.include_router(actions_router)
+app.include_router(events_router)
+app.include_router(actions_router)
 app.add_middleware(TenantJWTMiddleware)
 
 
