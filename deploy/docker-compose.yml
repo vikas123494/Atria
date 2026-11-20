@@ -59,6 +59,7 @@ services:
     profiles: ["edge"]
     environment:
       VEILOPS_DOMAIN: ${VEILOPS_DOMAIN:?Set VEILOPS_DOMAIN to a DNS name pointing at this host}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL for certificate notifications}
     ports:
       - "80:80"
       - "443:443"
