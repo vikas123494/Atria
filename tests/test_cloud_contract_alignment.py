@@ -40,7 +40,7 @@ def test_team_alert_accepts_high_severity_and_numeric_params():
         "params": {"value": 96.0, "threshold": 90, "breaching": 3, "of": 5},
         "event_ts": "2026-11-20T12:00:00.000Z", "source_tz": "Asia/Kolkata",
     }
-    assert Envelope.model_validate(envelope_with(record)).records[0].severity == "high"
+    assert Envelope.model_validate(envelope_with(record)).records[0]["severity"] == "high"
 
 
 def test_team_health_record_uses_lowercase_state_and_no_extra_fields():
@@ -48,7 +48,7 @@ def test_team_health_record_uses_lowercase_state_and_no_extra_fields():
         "type": "health", "entity": "svc_0123456789", "state": "poor",
         "reasons": ["service_unreachable"], "event_ts": "2026-11-20T12:00:00.000Z",
     }
-    assert Envelope.model_validate(envelope_with(record)).records[0].state == "poor"
+    assert Envelope.model_validate(envelope_with(record)).records[0]["state"] == "poor"
     record["state"] = "Poor"
     with pytest.raises(ValidationError):
         Envelope.model_validate(envelope_with(record))
