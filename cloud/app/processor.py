@@ -10,6 +10,14 @@ from redis.exceptions import ResponseError
 log = logging.getLogger(__name__)
 
 
+def calculate_event_time_watermark(previous_max: datetime | None, event_ts: datetime,
+                                   allowed_lateness: timedelta = timedelta(minutes=5)):
+    """Return (new_max_event_ts, watermark, is_late) for an event-time stream."""
+    max_event_ts = event_ts if previous_max is None else max(previous_max, event_ts)
+    watermark_ts = max_event_ts - allowed_lateness
+    return max_event_ts, watermark_ts, event_ts < watermark_ts
+
+
 def _dt(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
@@ -108,9 +116,9 @@ class StreamProcessor:
                WHERE tenant_id=$1 AND entity=$2 AND metric=$3 FOR UPDATE""",
             tenant_id, record["entity"], record["metric"],
         )
-        max_event_ts = max(watermark_row["max_event_ts"], event_ts)
-        watermark_ts = max_event_ts - timedelta(minutes=5)
-        is_late = event_ts < watermark_ts
+        max_event_ts, watermark_ts, is_late = calculate_event_time_watermark(
+            watermark_row["max_event_ts"], event_ts
+        )
         await conn.execute(
             """UPDATE event_time_watermarks
                SET max_event_ts=$4,watermark_ts=$5,updated_at=now()
