@@ -171,8 +171,10 @@ async def render_ack(payload: RenderAck, request: Request):
     rendered = rendered.astimezone(timezone.utc)
     source_event = source_event.astimezone(timezone.utc)
     observed = datetime.now(timezone.utc)
-    # End-to-end elapsed time from source event time to receipt of browser render acknowledgement.
-    delay_ms = max(0, int((rendered - source_event).total_seconds() * 1000))
+    if rendered > observed or source_event > rendered:
+        raise HTTPException(422, detail={"code": "INVALID_RENDER_TIMESTAMPS"})
+    # Architecture §22 defines delay as browser rendered_at minus source event_ts.
+    delay_ms = int((rendered - source_event).total_seconds() * 1000)
     async with request.app.state.db_pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant)
