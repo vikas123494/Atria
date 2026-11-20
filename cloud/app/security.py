@@ -64,7 +64,7 @@ async def authenticate_collector(request: Request, body: bytes) -> tuple[Collect
         raise HTTPException(401, detail={"code": "BAD_SIGNATURE"})
 
     secret = request.app.state.secret_box.decrypt(bytes(row["secret_ciphertext"]))
-    if not verify_hmac(secret, request.method, request.url.path, timestamp, nonce, body, signature):
+    request_path = request.url.path + (('?' + request.url.query) if request.url.query else '')\n    if not verify_hmac(secret, request.method, request_path, timestamp, nonce, body, signature):
         raise HTTPException(401, detail={"code": "BAD_SIGNATURE"})
 
     redis_key = f"nonce:{collector_id}:{nonce}"
