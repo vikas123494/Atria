@@ -1,124 +1,121 @@
-"""Versioned collector-to-cloud contracts (Architecture §12)."""
-from datetime import datetime, timezone
-from typing import Any, Literal
-from uuid import UUID
+"""Wire contracts aligned with the team's veilops/schema package (docs/CONTRACTS.md §6)."""
+from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
+# Match veilops/schema/common.py: strict, immutable models and the same safe wire types.
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-class PolicyRef(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+EntityId = Annotated[str, StringConstraints(pattern=r"^(h|svc|lnk)_[0-9a-f]{10}$")]
+PrincipalId = Annotated[str, StringConstraints(pattern=r"^usr_[0-9a-f]{10}$")]
+SourceId = Annotated[str, StringConstraints(pattern=r"^src_[0-9a-f]{10}$")]
+TenantId = Annotated[str, StringConstraints(pattern=r"^t_[a-z0-9_]{1,32}$")]
+CollectorId = Annotated[str, StringConstraints(pattern=r"^col_[a-z0-9_]{1,32}$")]
+Uuid = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")]
+UuidV7 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")]
+Sha256Hash = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
+UtcTimestamp = Annotated[str, StringConstraints(pattern=r"^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$")]
+TimezoneName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z][A-Za-z0-9_+\\-]*(/[A-Za-z0-9_+\\-]+){0,2}$")]
+SafeText = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.:<>=%/ ,()\\-]{1,160}$")]
+Num = Annotated[float, Field(allow_inf_nan=False)]
+ParamValue = Union[int, float]
+
+Region = Literal["in", "eu"]
+Severity = Literal["info", "warning", "high", "critical"]
+HealthState = Literal["excellent", "good", "fair", "poor"]
+EntityKind = Literal["host", "service", "link"]
+MetricName = Literal[
+    "cpu.util_pct", "mem.util_pct", "disk.util_pct", "disk.io_wait_pct",
+    "svc.up", "svc.resp_ms", "net.latency_ms", "net.loss_pct",
+    "net.bw_in_mbps", "net.bw_out_mbps", "net.reachable", "load.req_rate",
+]
+
+class PolicyRef(StrictModel):
     version: int = Field(ge=1)
-    hash: str = Field(pattern=r"^sha256:[0-9a-fA-F]{64}$")
+    hash: Sha256Hash
 
+class ChainRef(StrictModel):
+    prev_hash: Sha256Hash
+    payload_hash: Sha256Hash
 
-class ChainRef(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    prev_hash: str = Field(pattern=r"^sha256:[0-9a-fA-F]{64}$")
-    payload_hash: str = Field(pattern=r"^sha256:[0-9a-fA-F]{64}$")
-
-
-class MetricRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class MetricRecord(StrictModel):
     type: Literal["metric"]
-    entity: str = Field(min_length=1, max_length=128)
-    entity_kind: str = Field(min_length=1, max_length=32)
-    metric: str = Field(min_length=1, max_length=128)
-    unit: str = Field(min_length=1, max_length=32)
-    avg: float | None = None
-    min: float | None = None
-    max: float | None = None
-    p95: float | None = None
-    count: int = Field(ge=0)
-    window_s: int = Field(gt=0)
-    event_ts: datetime
-    source_tz: str = Field(min_length=1, max_length=64)
+    entity: EntityId
+    entity_kind: EntityKind
+    metric: MetricName
+    unit: Literal["pct", "ms", "mbps", "count", "bool", "rps"]
+    avg: Num
+    min: Num
+    max: Num
+    p95: Num
+    count: int = Field(ge=1)
+    window_s: int = Field(gt=0, le=3600)
+    event_ts: UtcTimestamp
+    source_tz: TimezoneName
 
-
-class SecuritySummaryRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class SecuritySummaryRecord(StrictModel):
     type: Literal["security_summary"]
-    category: str = Field(min_length=1, max_length=128)
-    severity: Literal["info", "low", "medium", "high", "critical"]
+    category: Literal[
+        "auth.bruteforce", "auth.password_spray", "auth.spray",
+        "auth.credential_stuffing", "auth.stuffing",
+    ]
+    severity: Severity
     count: int = Field(ge=0)
     distinct_principals: int = Field(ge=0)
     distinct_sources: int = Field(ge=0)
-    principals: list[str] = Field(default_factory=list)
-    sources: list[str] = Field(default_factory=list)
+    principals: list[PrincipalId] = Field(max_length=20)
+    sources: list[SourceId] = Field(max_length=20)
     risk_score: int = Field(ge=0, le=100)
-    window_s: int = Field(gt=0)
-    event_ts: datetime
-    source_tz: str = Field(min_length=1, max_length=64)
+    window_s: int = Field(gt=0, le=3600)
+    event_ts: UtcTimestamp
+    source_tz: TimezoneName
 
-
-class AlertRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class AlertRecord(StrictModel):
     type: Literal["alert"]
-    alert_id: UUID
-    entity: str = Field(min_length=1, max_length=128)
-    rule: str = Field(min_length=1, max_length=128)
-    severity: Literal["info", "warning", "critical"]
-    template_id: str = Field(min_length=1, max_length=64)
-    params: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
-    event_ts: datetime
-    source_tz: str = Field(min_length=1, max_length=64)
+    alert_id: Uuid
+    entity: EntityId
+    rule: str = Field(pattern=r"^[a-z0-9_.]{1,64}$")
+    severity: Severity
+    template_id: str = Field(pattern=r"^T_[A-Z0-9_]{1,48}$")
+    params: dict[str, ParamValue] = Field(max_length=16)
+    event_ts: UtcTimestamp
+    source_tz: TimezoneName
 
-
-class HealthRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class HealthRecord(StrictModel):
     type: Literal["health"]
-    entity: str = Field(min_length=1, max_length=128)
-    state: Literal["Excellent", "Good", "Fair", "Poor"]
-    score: float | None = Field(default=None, ge=0, le=100)
-    reasons: list[str] = Field(default_factory=list, max_length=32)
-    event_ts: datetime
-    source_tz: str = Field(min_length=1, max_length=64)
+    entity: EntityId
+    state: HealthState
+    reasons: list[SafeText] = Field(max_length=8)
+    event_ts: UtcTimestamp
 
+class TopologyEdge(StrictModel):
+    src: EntityId
+    dst: EntityId
+    rel: Literal["runs_on", "depends_on", "routes_via", "connects_via"]
 
-Record = MetricRecord | SecuritySummaryRecord | AlertRecord | HealthRecord
+class TopologyRecord(StrictModel):
+    type: Literal["topology"]
+    edges: list[TopologyEdge] = Field(max_length=500)
+    event_ts: UtcTimestamp
 
+Record = Annotated[
+    Union[MetricRecord, SecuritySummaryRecord, AlertRecord, HealthRecord, TopologyRecord],
+    Field(discriminator="type"),
+]
 
-class Envelope(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    schema_version: Literal["1.0"]
-    payload_id: UUID
-    tenant_id: str = Field(min_length=1, max_length=128)
-    collector_id: str = Field(min_length=1, max_length=128)
-    region: Literal["in", "eu"]
+class Envelope(StrictModel):
+    schema_version: str = Field(pattern=r"^\\d{1,2}\\.\\d{1,2}$")
+    payload_id: UuidV7
+    tenant_id: TenantId
+    collector_id: CollectorId
+    region: Region
     seq: int = Field(ge=1)
-    sent_at: datetime
+    sent_at: UtcTimestamp
     policy: PolicyRef
     chain: ChainRef
-    records: list[dict[str, Any]] = Field(min_length=1, max_length=5000)
+    records: list[Record] = Field(min_length=1, max_length=500)
 
-    @field_validator("payload_id")
-    @classmethod
-    def require_uuid7(cls, value: UUID) -> UUID:
-        if value.version != 7:
-            raise ValueError("payload_id must be UUIDv7")
-        return value
-
-    @field_validator("sent_at")
-    @classmethod
-    def require_utc(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("sent_at must include a timezone")
-        return value.astimezone(timezone.utc)
-
-    @model_validator(mode="after")
-    def validate_records(self):
-        allowed = {
-            "metric": MetricRecord,
-            "security_summary": SecuritySummaryRecord,
-            "alert": AlertRecord,
-            "health": HealthRecord,
-        }
-        parsed = []
-        for item in self.records:
-            kind = item.get("type") if isinstance(item, dict) else None
-            model = allowed.get(kind)
-            if model is None:
-                raise ValueError(f"UNKNOWN_RECORD_TYPE: {kind!r}")
-            parsed.append(model.model_validate(item))
-        self.records = [item.model_dump(mode="json") for item in parsed]
-        return self
+    def model_dump_records(self) -> list[dict]:
+        """Return wire records as JSON-compatible dictionaries for Redis/Postgres."""
+        return [record.model_dump(mode="json") for record in self.records]

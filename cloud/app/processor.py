@@ -42,7 +42,6 @@ class StreamProcessor:
         await self.ensure_group()
         while not stop.is_set():
             try:
-                # Recover messages left pending by a crashed consumer.
                 claimed = await self.redis.xautoclaim(
                     self.stream, self.group, self.consumer,
                     min_idle_time=30_000, start_id="0-0", count=25,
@@ -75,9 +74,6 @@ class StreamProcessor:
                        VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING payload_id""",
                     tenant_id, payload_id,
                 )
-                # Redis may redeliver after a crash between PG commit and XACK.
-                # This ledger prevents duplicate side effects while allowing the
-                # notification to be republished before the stream entry is ACKed.
                 if claimed:
                     for record in body["records"]:
                         kind = record["type"]
@@ -98,11 +94,27 @@ class StreamProcessor:
                             await self._alert(conn, tenant_id, record, event_ts)
                         elif kind == "health":
                             await self._health(conn, tenant_id, record, event_ts)
+                        elif kind == "topology":
+                            await self._topology(conn, tenant_id, record, event_ts)
         await self.redis.publish(
             f"veilops:tenant:{tenant_id}:events",
             json.dumps({"event": "telemetry_processed", "collector_id": collector_id, "payload_id": str(payload_id)}),
         )
         await self.redis.xack(self.stream, self.group, message_id)
+
+    async def _topology(self, conn, tenant_id, record, event_ts):
+        # Each topology record is the collector's complete current graph for this tenant.
+        # Replace atomically so removed edges do not remain in the cloud's graph.
+        await conn.execute("DELETE FROM topology_edges WHERE tenant_id=$1", tenant_id)
+        for edge in record["edges"]:
+            await conn.execute(
+                """INSERT INTO topology_edges
+                   (tenant_id,source_entity,target_entity,relation,updated_at)
+                   VALUES($1,$2,$3,$4,$5)
+                   ON CONFLICT(tenant_id,source_entity,target_entity,relation)
+                   DO UPDATE SET updated_at=EXCLUDED.updated_at""",
+                tenant_id, edge["src"], edge["dst"], edge["rel"], event_ts,
+            )
 
     async def _metric(self, conn, tenant_id, collector_id, payload_id, record, event_ts):
         await conn.execute(
@@ -110,8 +122,6 @@ class StreamProcessor:
                VALUES($1,$2,$3,$4) ON CONFLICT(tenant_id,entity) DO NOTHING""",
             tenant_id, record["entity"], record["entity_kind"], collector_id,
         )
-        # Serialize watermark advancement per tenant/entity/metric. Late data is
-        # retained; the flag makes it observable for reconciliation/recomputation.
         await conn.execute(
             """INSERT INTO event_time_watermarks
                (tenant_id,entity,metric,max_event_ts,watermark_ts)
@@ -146,7 +156,7 @@ class StreamProcessor:
                    received_at=now()
                WHERE EXCLUDED.count > metric_points.count""",
             tenant_id, record["entity"], record["metric"], event_ts, record["source_tz"],
-            record.get("avg"), record.get("min"), record.get("max"), record.get("p95"),
+            record["avg"], record["min"], record["max"], record["p95"],
             record["count"], payload_id, is_late, watermark_ts,
         )
         if is_late:
@@ -185,7 +195,9 @@ class StreamProcessor:
 
     async def _health(self, conn, tenant_id, record, event_ts):
         entity = record["entity"]
-        state = record["state"]
+        # Wire schema uses lowercase health states; internal Cloud tables/API retain
+        # the architecture's title-case state vocabulary.
+        state = record["state"].capitalize()
         reasons = json.dumps(record.get("reasons", []))
         previous = await conn.fetchrow(
             "SELECT state FROM health_current WHERE tenant_id=$1 AND entity=$2 FOR UPDATE",
@@ -195,17 +207,17 @@ class StreamProcessor:
             await conn.execute(
                 """INSERT INTO health_current
                    (tenant_id,entity,state,score,reasons,since,last_data_ts)
-                   VALUES($1,$2,$3,$4,$5::jsonb,$6,$6)""",
-                tenant_id, entity, state, record.get("score"), reasons, event_ts,
+                   VALUES($1,$2,$3,NULL,$4::jsonb,$5,$5)""",
+                tenant_id, entity, state, reasons, event_ts,
             )
             old_state = None
         else:
             old_state = previous["state"]
             await conn.execute(
-                """UPDATE health_current SET state=$3,score=$4,reasons=$5::jsonb,
-                   since=CASE WHEN state<>$3 THEN $6 ELSE since END,last_data_ts=$6
+                """UPDATE health_current SET state=$3,reasons=$4::jsonb,
+                   since=CASE WHEN state<>$3 THEN $5 ELSE since END,last_data_ts=$5
                    WHERE tenant_id=$1 AND entity=$2""",
-                tenant_id, entity, state, record.get("score"), reasons, event_ts,
+                tenant_id, entity, state, reasons, event_ts,
             )
         if old_state != state:
             await conn.execute(
