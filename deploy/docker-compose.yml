@@ -38,6 +38,9 @@ services:
     environment:
       DATABASE_URL: postgresql://veilops_app:veilops_app_dev_only@postgres:5432/veilops
       REDIS_URL: redis://redis:6379/0
+      VEILOPS_REGION: ${VEILOPS_REGION:-in}
+      INGEST_STREAM: veilops:ingest
+      COLLECTOR_SECRET_ENCRYPTION_KEY: ${COLLECTOR_SECRET_ENCRYPTION_KEY:?Set a URL-safe base64 32-byte key}
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
