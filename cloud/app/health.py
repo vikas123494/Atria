@@ -15,11 +15,13 @@ def heartbeat_state(last_seen: datetime | None, now: datetime | None = None) -> 
     if last_seen is None:
         return "Poor", ["no_heartbeat_received"]
     age = max(0.0, (now - last_seen).total_seconds())
-    if age >= 30:
-        return "Poor", ["heartbeat_missing_30s"]
+    if age > 30:
+        return "Poor", ["heartbeat_missing_over_30s"]
     if age >= 15:
         return "Fair", ["heartbeat_missing_15s"]
-    return "Good", ["heartbeat_recent"]
+    if age >= 10:
+        return "Good", ["heartbeat_delayed_10s"]
+    return "Excellent", ["heartbeat_recent"]
 
 
 def metric_state(value: float, good: float | None, fair: float | None,
@@ -111,7 +113,7 @@ async def evaluate_collector_health(pool, tenant_id: str, collector_id: str,
             for entity_row in entities:
                 entity = entity_row["entity"]
                 metric_rows = await conn.fetch(
-                    """SELECT m.metric,m.avg,m.max,m.event_ts,t.good,t.fair,t.poor
+                    """SELECT m.metric,m.avg,m.max,m.event_ts,t.good,t.fair,t.poor,t.hysteresis
                        FROM metric_points m
                        LEFT JOIN thresholds t
                          ON t.tenant_id=m.tenant_id AND t.metric=m.metric
@@ -129,6 +131,7 @@ async def evaluate_collector_health(pool, tenant_id: str, collector_id: str,
                 for metric, samples in by_metric.items():
                     thresholds = samples[0]
                     good, fair, poor = thresholds["good"], thresholds["fair"], thresholds["poor"]
+                    hysteresis = float(thresholds["hysteresis"] if thresholds["hysteresis"] is not None else 0.10)
                     if good is None and fair is None and poor is None:
                         continue
                     values = [
@@ -148,7 +151,7 @@ async def evaluate_collector_health(pool, tenant_id: str, collector_id: str,
                     previous_metric_state = prior["state"] if prior else None
                     if (previous_metric_state is not None
                             and STATES.index(candidate) < STATES.index(previous_metric_state)
-                            and not recovered_inside_margin(values, candidate, good, fair, poor)):
+                            and not recovered_inside_margin(values, candidate, good, fair, poor, hysteresis)):
                         candidate = previous_metric_state
                         reasons.append(f"{metric}:recovery_hysteresis_pending")
                     await conn.execute(
@@ -235,25 +238,35 @@ async def late_metric_recompute_loop(pool, interval_seconds: int = 2, stop_event
     while stop_event is None or not stop_event.is_set():
         item = None
         try:
+            # tenants is global control-plane metadata; set tenant context before
+            # reading or claiming any RLS-protected queue/entity rows.
             async with pool.acquire() as conn:
-                async with conn.transaction():
-                    item = await conn.fetchrow(
-                        """SELECT q.id,q.tenant_id,q.entity,e.collector_id
-                           FROM late_metric_recomputations q
-                           JOIN entities e
-                             ON e.tenant_id=q.tenant_id AND e.entity=q.entity
-                           WHERE q.processed_at IS NULL
-                             AND (q.claimed_at IS NULL OR q.claimed_at < now() - INTERVAL '2 minutes')
-                           ORDER BY q.queued_at
-                           FOR UPDATE OF q SKIP LOCKED LIMIT 1"""
-                    )
-                    if item:
-                        await conn.execute(
-                            """UPDATE late_metric_recomputations
-                               SET claimed_at=now(),attempts=attempts+1,last_error=NULL
-                               WHERE id=$1""",
-                            item["id"],
+                tenant_ids = await conn.fetch("SELECT tenant_id FROM tenants ORDER BY tenant_id")
+            for tenant_row in tenant_ids:
+                tenant_id = tenant_row["tenant_id"]
+                async with pool.acquire() as conn:
+                    async with conn.transaction():
+                        await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant_id)
+                        item = await conn.fetchrow(
+                            """SELECT q.id,q.tenant_id,q.entity,e.collector_id
+                               FROM late_metric_recomputations q
+                               JOIN entities e
+                                 ON e.tenant_id=q.tenant_id AND e.entity=q.entity
+                               WHERE q.tenant_id=$1 AND q.processed_at IS NULL
+                                 AND (q.claimed_at IS NULL OR q.claimed_at < now() - INTERVAL '2 minutes')
+                               ORDER BY q.queued_at
+                               FOR UPDATE OF q SKIP LOCKED LIMIT 1""",
+                            tenant_id,
                         )
+                        if item:
+                            await conn.execute(
+                                """UPDATE late_metric_recomputations
+                                   SET claimed_at=now(),attempts=attempts+1,last_error=NULL
+                                   WHERE id=$1""",
+                                item["id"],
+                            )
+                if item:
+                    break
             if item:
                 await evaluate_collector_health(
                     pool, item["tenant_id"], item["collector_id"]
