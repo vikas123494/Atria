@@ -1,0 +1,79 @@
+name: veilops-cloud-core
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: veilops
+      POSTGRES_USER: veilops
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-veilops_dev_only}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../cloud/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U veilops -d veilops"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  cloud-api:
+    build:
+      context: ..
+      dockerfile: cloud/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://veilops_app:veilops_app_dev_only@postgres:5432/veilops
+      REDIS_URL: redis://redis:6379/0
+      VEILOPS_REGION: ${VEILOPS_REGION:-in}
+      INGEST_BASE_URL: ${INGEST_BASE_URL:-http://localhost:8000/v1}
+      INGEST_STREAM: veilops:ingest
+      COLLECTOR_SECRET_ENCRYPTION_KEY: ${COLLECTOR_SECRET_ENCRYPTION_KEY:?Set a URL-safe base64 32-byte key}
+      SAAS_ED25519_PRIVATE_KEY: ${SAAS_ED25519_PRIVATE_KEY:?Set an independent URL-safe base64 32-byte seed}
+      DASHBOARD_JWT_SECRET: ${DASHBOARD_JWT_SECRET:?Set a random dashboard JWT signing secret of at least 32 characters}
+      DASHBOARD_JWT_ISSUER: veilops-control
+      DASHBOARD_JWT_AUDIENCE: veilops-dashboard
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+
+  caddy:
+    image: caddy:2
+    profiles: ["edge"]
+    environment:
+      VEILOPS_DOMAIN: ${VEILOPS_DOMAIN:?Set VEILOPS_DOMAIN to a DNS name pointing at this host}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL for certificate notifications}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - cloud-api
+
+volumes:
+  postgres_data:
+  redis_data:
+  caddy_data:
+  caddy_config:

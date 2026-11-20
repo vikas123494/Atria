@@ -1,0 +1,33 @@
+name: Cloud Core CI
+
+on:
+  push:
+    branches: [main, person-c/cloud-core-foundation]
+    paths:
+      - "cloud/**"
+      - "deploy/**"
+      - "tests/**"
+      - ".github/workflows/cloud-core.yml"
+  pull_request:
+    paths:
+      - "cloud/**"
+      - "deploy/**"
+      - "tests/**"
+      - ".github/workflows/cloud-core.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: cloud/requirements.txt
+      - name: Install dependencies
+        run: python -m pip install -r cloud/requirements.txt
+      - name: Compile Cloud Core
+        run: python -m compileall -q cloud
+      - name: Run Cloud Core tests
+        run: python -m pytest -q tests
