@@ -1,6 +1,8 @@
 """Collector/cloud sequence reconciliation API (Architecture §13, §17)."""
 from fastapi import APIRouter, HTTPException, Query, Request
 
+from cloud.app.security import authenticate_collector
+
 router = APIRouter(prefix="/v1", tags=["reconciliation"])
 
 
@@ -9,13 +11,13 @@ async def reconcile(request: Request, collector_id: str,
                     from_seq: int = Query(ge=1), to_seq: int = Query(ge=1)):
     if to_seq < from_seq or to_seq - from_seq > 10000:
         raise HTTPException(422, detail={"code": "SCHEMA_VIOLATION"})
+    # The request signature covers the exact query string so the requested
+    # reconciliation range cannot be changed independently of its HMAC.
+    body = await request.body()
+    auth, collector = await authenticate_collector(request, body)
+    if collector_id != auth.collector_id:
+        raise HTTPException(403, detail={"code": "TENANT_MISMATCH"})
     async with request.app.state.db_pool.acquire() as conn:
-        collector = await conn.fetchrow(
-            "SELECT tenant_id,region FROM collectors WHERE collector_id=$1 AND revoked_at IS NULL",
-            collector_id,
-        )
-        if not collector:
-            raise HTTPException(404, detail={"code": "COLLECTOR_NOT_FOUND"})
         await conn.execute("SELECT set_config('app.tenant_id',$1,true)", collector["tenant_id"])
         rows = await conn.fetch(
             """SELECT seq FROM ingest_receipts
