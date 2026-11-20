@@ -2,7 +2,7 @@
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from redis.exceptions import ResponseError
@@ -94,19 +94,48 @@ class StreamProcessor:
                VALUES($1,$2,$3,$4) ON CONFLICT(tenant_id,entity) DO NOTHING""",
             tenant_id, record["entity"], record["entity_kind"], collector_id,
         )
+        # Serialize watermark advancement per tenant/entity/metric. Late data is
+        # retained; the flag makes it observable for reconciliation/recomputation.
+        await conn.execute(
+            """INSERT INTO event_time_watermarks
+               (tenant_id,entity,metric,max_event_ts,watermark_ts)
+               VALUES($1,$2,$3,$4,$4 - INTERVAL '5 minutes')
+               ON CONFLICT(tenant_id,entity,metric) DO NOTHING""",
+            tenant_id, record["entity"], record["metric"], event_ts,
+        )
+        watermark_row = await conn.fetchrow(
+            """SELECT max_event_ts FROM event_time_watermarks
+               WHERE tenant_id=$1 AND entity=$2 AND metric=$3 FOR UPDATE""",
+            tenant_id, record["entity"], record["metric"],
+        )
+        max_event_ts = max(watermark_row["max_event_ts"], event_ts)
+        watermark_ts = max_event_ts - timedelta(minutes=5)
+        is_late = event_ts < watermark_ts
+        await conn.execute(
+            """UPDATE event_time_watermarks
+               SET max_event_ts=$4,watermark_ts=$5,updated_at=now()
+               WHERE tenant_id=$1 AND entity=$2 AND metric=$3""",
+            tenant_id, record["entity"], record["metric"], max_event_ts, watermark_ts,
+        )
         await conn.execute(
             """INSERT INTO metric_points
-               (tenant_id,entity,metric,event_ts,source_tz,avg,min,max,p95,count,payload_id)
-               VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+               (tenant_id,entity,metric,event_ts,source_tz,avg,min,max,p95,count,payload_id,
+                late_arrival,watermark_ts)
+               VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                ON CONFLICT(tenant_id,entity,metric,event_ts) DO UPDATE
                SET avg=EXCLUDED.avg,min=EXCLUDED.min,max=EXCLUDED.max,
                    p95=EXCLUDED.p95,count=EXCLUDED.count,payload_id=EXCLUDED.payload_id,
+                   late_arrival=metric_points.late_arrival OR EXCLUDED.late_arrival,
+                   watermark_ts=GREATEST(metric_points.watermark_ts,EXCLUDED.watermark_ts),
                    received_at=now()
                WHERE EXCLUDED.count > metric_points.count""",
             tenant_id, record["entity"], record["metric"], event_ts, record["source_tz"],
             record.get("avg"), record.get("min"), record.get("max"), record.get("p95"),
-            record["count"], payload_id,
+            record["count"], payload_id, is_late, watermark_ts,
         )
+        if is_late:
+            log.info("Stored late metric event for recomputation: tenant=%s entity=%s metric=%s event_ts=%s watermark=%s",
+                     tenant_id, record["entity"], record["metric"], event_ts, watermark_ts)
 
     async def _alert(self, conn, tenant_id, record, event_ts):
         observed = datetime.now(timezone.utc)
