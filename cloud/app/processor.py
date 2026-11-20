@@ -214,7 +214,7 @@ class StreamProcessor:
         else:
             old_state = previous["state"]
             await conn.execute(
-                """UPDATE health_current SET state=$3,reasons=$4::jsonb,
+                """UPDATE health_current SET state=$3,score=NULL,reasons=$4::jsonb,
                    since=CASE WHEN state<>$3 THEN $5 ELSE since END,last_data_ts=$5
                    WHERE tenant_id=$1 AND entity=$2""",
                 tenant_id, entity, state, reasons, event_ts,

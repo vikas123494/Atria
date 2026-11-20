@@ -39,7 +39,7 @@ async def ingest(request: Request):
         raise HTTPException(422, detail={"code": "SCHEMA_VIOLATION", "field": "Idempotency-Key"})
 
     payload_hash = "sha256:" + hashlib.sha256(body).hexdigest()
-    sent_at = envelope.sent_at.astimezone(timezone.utc)
+    sent_at = datetime.fromisoformat(envelope.sent_at.replace('Z', '+00:00')).astimezone(timezone.utc)
     now = datetime.now(timezone.utc)
     if abs((now - sent_at).total_seconds()) > 86400:
         # Sent-at is a clock-skew signal, not the replay defense; the signed
@@ -93,8 +93,8 @@ async def ingest(request: Request):
                 raise
 
             event_times = [
-                datetime.fromisoformat(record["event_ts"].replace("Z", "+00:00"))
-                for record in envelope.records if record.get("event_ts")
+                datetime.fromisoformat(record.event_ts.replace("Z", "+00:00"))
+                for record in envelope.records
             ]
             if event_times:
                 oldest_event = min(event_times)
