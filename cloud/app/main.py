@@ -12,7 +12,7 @@ from cloud.app.auth import TenantJWTMiddleware
 from cloud.app.control import router as control_router
 from cloud.app.crypto import ReceiptSigner, SecretBox
 from cloud.app.events import router as events_router
-from cloud.app.health import watchdog_loop
+from cloud.app.health import late_metric_recompute_loop, watchdog_loop
 from cloud.app.ingest import router as ingest_router
 from cloud.app.processor import StreamProcessor
 from cloud.app.reconciliation import router as reconciliation_router
@@ -35,6 +35,7 @@ async def lifespan(app: FastAPI):
     )
     app.state.processor_stop = asyncio.Event()
     app.state.watchdog_stop = asyncio.Event()
+    app.state.recompute_stop = asyncio.Event()
     processor = StreamProcessor(app.state.redis, app.state.db_pool, settings.ingest_stream)
     app.state.processor_task = asyncio.create_task(
         processor.run(app.state.processor_stop), name="veilops-stream-writer"
@@ -43,14 +44,20 @@ async def lifespan(app: FastAPI):
         watchdog_loop(app.state.db_pool, stop_event=app.state.watchdog_stop),
         name="veilops-health-watchdog",
     )
+    app.state.recompute_task = asyncio.create_task(
+        late_metric_recompute_loop(app.state.db_pool, stop_event=app.state.recompute_stop),
+        name="veilops-late-metric-recompute",
+    )
     try:
         yield
     finally:
         app.state.processor_stop.set()
         app.state.watchdog_stop.set()
+        app.state.recompute_stop.set()
         app.state.processor_task.cancel()
         app.state.watchdog_task.cancel()
-        for task in (app.state.processor_task, app.state.watchdog_task):
+        app.state.recompute_task.cancel()
+        for task in (app.state.processor_task, app.state.watchdog_task, app.state.recompute_task):
             try:
                 await task
             except asyncio.CancelledError:
