@@ -94,6 +94,15 @@ async def evaluate_collector_health(pool, tenant_id: str, collector_id: str,
                 tenant_id, collector_id,
             )
             hb_state, hb_reasons = heartbeat_state(last, now)
+            if hb_state == "Poor" and last is not None:
+                offline_delay_ms = max(0, int((now - last).total_seconds() * 1000))
+                await conn.execute(
+                    """INSERT INTO slo_samples
+                       (tenant_id,kind,sample_key,event_ts,observed_ts,delay_ms)
+                       VALUES($1,'collector_offline_detection',$2,$3,$4,$5)
+                       ON CONFLICT DO NOTHING""",
+                    tenant_id, collector_id, last, now, offline_delay_ms,
+                )
             entities = await conn.fetch(
                 "SELECT entity FROM entities WHERE tenant_id=$1 AND collector_id=$2",
                 tenant_id, collector_id,
