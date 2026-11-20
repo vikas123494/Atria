@@ -124,33 +124,37 @@ class RenderAck(BaseModel):
     model_config = ConfigDict(extra="forbid")
     sample_key: str = Field(min_length=1, max_length=128)
     rendered_at: datetime
+    source_event_ts: datetime
 
 
 @router.post("/slo/render-ack", status_code=202)
 async def render_ack(payload: RenderAck, request: Request):
     tenant = tenant_from_request(request)
     rendered = payload.rendered_at
-    if rendered.tzinfo is None:
+    source_event = payload.source_event_ts
+    if rendered.tzinfo is None or source_event.tzinfo is None:
         raise HTTPException(422, detail={"code": "SCHEMA_VIOLATION"})
     rendered = rendered.astimezone(timezone.utc)
+    source_event = source_event.astimezone(timezone.utc)
     observed = datetime.now(timezone.utc)
-    delay_ms = max(0, int((observed - rendered).total_seconds() * 1000))
+    # End-to-end elapsed time from source event time to receipt of browser render acknowledgement.
+    delay_ms = max(0, int((observed - source_event).total_seconds() * 1000))
     async with request.app.state.db_pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant)
             await conn.execute(
                 """INSERT INTO slo_samples
                    (tenant_id,kind,sample_key,event_ts,observed_ts,delay_ms)
-                   VALUES($1,'dashboard_render', $2, $3, $4, $5)
+                   VALUES($1,'collection_to_dashboard', $2, $3, $4, $5)
                    ON CONFLICT(tenant_id,kind,sample_key,event_ts) DO NOTHING""",
-                tenant, payload.sample_key, rendered, observed, delay_ms,
+                tenant, payload.sample_key, source_event, observed, delay_ms,
             )
             await conn.execute(
                 """INSERT INTO audit_events
                    (tenant_id,actor_id,action,resource_type,resource_id,details)
                    VALUES($1,$2,'slo.render_ack','slo_sample',$3,$4::jsonb)""",
                 tenant, request.state.user_id, payload.sample_key,
-                __import__("json").dumps({"delay_ms": delay_ms}),
+                __import__("json").dumps({"delay_ms": delay_ms, "rendered_at": rendered.isoformat(), "source_event_ts": source_event.isoformat()}),
             )
     return {"accepted": True, "delay_ms": delay_ms}
 
@@ -212,6 +216,12 @@ async def judge_mode_slo(request: Request):
 
     alert = measured.get("threshold_to_alert")
     alert_p95 = alert["p95_ms"] if alert else None
+    dashboard = measured.get("collection_to_dashboard")
+    dashboard_p95 = dashboard["p95_ms"] if dashboard else None
+    offline = measured.get("collector_offline_detection")
+    offline_p95 = offline["p95_ms"] if offline else None
+    reconciliation = measured.get("reconciliation_missing_sequences")
+    reconciliation_p95 = reconciliation["p95_ms"] if reconciliation else None
     return {
         "window": "24h",
         "targets": {
@@ -227,13 +237,25 @@ async def judge_mode_slo(request: Request):
                 "insufficient_data" if alert_p95 is None
                 else "pass" if alert_p95 <= 15000 else "fail"
             ),
-            "collection_to_dashboard": "not_instrumented_end_to_end",
-            "collector_offline_detection": "not_instrumented_as_slo_sample",
-            "reconciliation": "not_instrumented_as_slo_sample",
+            "collection_to_dashboard": (
+                "insufficient_data" if dashboard_p95 is None
+                else "pass" if dashboard_p95 <= 10000 else "fail"
+            ),
+            "collector_offline_detection": (
+                "insufficient_data" if offline_p95 is None
+                else "pass" if offline_p95 <= 60000 else "fail"
+            ),
+            "reconciliation_missing_sequences_p95": (
+                "insufficient_data" if reconciliation_p95 is None
+                else "pass" if reconciliation_p95 == 0 else "fail"
+            ),
+            "reconciliation_duplicate_protection": "enforced_by_unique_collector_sequence_constraint",
         },
         "notes": [
             "p95 is calculated from observed samples in the last 24 hours.",
-            "dashboard_render samples measure render-ack receipt delay, not collection-to-dashboard end-to-end latency.",
-            "A missing measurement is reported as not instrumented, never as a passing SLO.",
+            "collection_to_dashboard measures source event timestamp to browser render acknowledgement receipt; client must send source_event_ts for the displayed data.",
+            "collector_offline_detection measures elapsed time from last heartbeat to watchdog detection.",
+            "reconciliation_missing_sequences stores the missing sequence count in delay_ms; despite the column name, this value is a count, not a duration.",
+            "A missing measurement is reported as insufficient_data, never as a passing SLO.",
         ],
     }
