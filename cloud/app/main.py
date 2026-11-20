@@ -6,7 +6,8 @@ import asyncpg
 from fastapi import FastAPI, HTTPException, Request
 from redis.asyncio import Redis
 
-from cloud.app.actions import router as actions_router\nfrom cloud.app.api import router as dashboard_router
+from cloud.app.actions import router as actions_router
+from cloud.app.api import router as dashboard_router
 from cloud.app.auth import TenantJWTMiddleware
 from cloud.app.control import router as control_router
 from cloud.app.crypto import ReceiptSigner, SecretBox
