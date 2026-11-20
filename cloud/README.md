@@ -70,3 +70,43 @@ Migrations are ordered SQL scripts for fresh local database initialization. Exis
 volumes require an explicit migration process; the official Postgres init directory
 does not rerun scripts on an initialized volume. The local Compose credentials are
 demo-only and must be replaced before any shared or production deployment.
+
+
+## Event-time processing and late telemetry
+
+Metric streams maintain a per-tenant/entity/metric event-time watermark. The watermark
+is the maximum observed event timestamp minus five minutes. Events older than the
+current watermark are still persisted (never silently discarded) and marked
+`late_arrival=true` with the watermark used for classification. This preserves
+late evidence for downstream recomputation and audit. The watermark is advanced
+inside the same PostgreSQL transaction as metric persistence.
+
+## Judge Mode SLO report
+
+`GET /api/v1/slo/judge-mode` returns a 24-hour report with sample counts and p95
+latencies. It evaluates threshold-to-alert against the 15-second target. The
+collection-to-dashboard (10-second), collector-offline (60-second), and
+reconciliation (zero loss/duplicates) targets are explicitly reported as
+not instrumented until end-to-end measurements exist. Dashboard render-ack
+receipt delay is diagnostic only; it is not mislabeled as collection-to-dashboard
+latency. Missing measurements never count as passing.
+
+## TLS edge proxy
+
+For a public deployment with DNS already pointing to the host, set
+`VEILOPS_DOMAIN` and `ACME_EMAIL`, then start the optional edge profile:
+
+```bash
+docker compose -f deploy/docker-compose.yml --profile edge up --build
+```
+
+Caddy obtains and renews HTTPS certificates and reverse-proxies to the private
+Cloud API container. The API's direct port remains loopback-bound. Do not expose
+the demo credentials or placeholder regional endpoints publicly.
+
+## Migration 008
+
+The event-time watermark migration adds columns to `metric_points` and creates
+the RLS-protected `event_time_watermarks` table. As with the other migrations,
+it is automatically applied only when PostgreSQL initializes a fresh volume;
+existing deployments need a controlled migration run.
