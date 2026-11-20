@@ -186,3 +186,54 @@ async def audit_events(request: Request, limit: int = Query(100, ge=1, le=1000))
                 tenant, limit,
             )
     return {"events": [dict(r) for r in rows]}
+
+
+@router.get("/slo/judge-mode")
+async def judge_mode_slo(request: Request):
+    """Return measured SLOs and explicitly identify metrics not yet instrumented."""
+    tenant = tenant_from_request(request)
+    async with request.app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant)
+            rows = await conn.fetch(
+                """SELECT kind, count(*) AS sample_count,
+                          percentile_cont(0.95) WITHIN GROUP (ORDER BY delay_ms) AS p95_ms,
+                          max(observed_ts) AS latest_sample
+                   FROM slo_samples
+                   WHERE tenant_id=$1 AND event_ts >= now() - INTERVAL '24 hours'
+                   GROUP BY kind ORDER BY kind""",
+                tenant,
+            )
+    measured = {row["kind"]: {
+        "sample_count": row["sample_count"],
+        "p95_ms": float(row["p95_ms"]) if row["p95_ms"] is not None else None,
+        "latest_sample": row["latest_sample"],
+    } for row in rows}
+
+    alert = measured.get("threshold_to_alert")
+    alert_p95 = alert["p95_ms"] if alert else None
+    return {
+        "window": "24h",
+        "targets": {
+            "collection_to_dashboard_p95_ms": 10000,
+            "threshold_to_alert_p95_ms": 15000,
+            "collector_offline_detection_ms": 60000,
+            "reconciliation_loss": 0,
+            "reconciliation_duplicates": 0,
+        },
+        "measured": measured,
+        "evaluation": {
+            "threshold_to_alert": (
+                "insufficient_data" if alert_p95 is None
+                else "pass" if alert_p95 <= 15000 else "fail"
+            ),
+            "collection_to_dashboard": "not_instrumented_end_to_end",
+            "collector_offline_detection": "not_instrumented_as_slo_sample",
+            "reconciliation": "not_instrumented_as_slo_sample",
+        },
+        "notes": [
+            "p95 is calculated from observed samples in the last 24 hours.",
+            "dashboard_render samples measure render-ack receipt delay, not collection-to-dashboard end-to-end latency.",
+            "A missing measurement is reported as not instrumented, never as a passing SLO.",
+        ],
+    }
