@@ -14,7 +14,7 @@ from cloud.app.crypto import ReceiptSigner, SecretBox
 from cloud.app.events import router as events_router
 from cloud.app.health import late_metric_recompute_loop, watchdog_loop
 from cloud.app.ingest import router as ingest_router
-from cloud.app.processor import StreamProcessor
+from cloud.app.processor import StreamProcessor, stream_outbox_publisher
 from cloud.app.reconciliation import router as reconciliation_router
 from cloud.app.settings import Settings
 
@@ -36,9 +36,15 @@ async def lifespan(app: FastAPI):
     app.state.processor_stop = asyncio.Event()
     app.state.watchdog_stop = asyncio.Event()
     app.state.recompute_stop = asyncio.Event()
+    app.state.publisher_stop = asyncio.Event()
     processor = StreamProcessor(app.state.redis, app.state.db_pool, settings.ingest_stream)
     app.state.processor_task = asyncio.create_task(
         processor.run(app.state.processor_stop), name="veilops-stream-writer"
+    )
+    app.state.publisher_task = asyncio.create_task(
+        stream_outbox_publisher(app.state.redis, app.state.db_pool, settings.ingest_stream,
+                                stop_event=app.state.publisher_stop),
+        name="veilops-ingest-outbox-publisher",
     )
     app.state.watchdog_task = asyncio.create_task(
         watchdog_loop(app.state.db_pool, stop_event=app.state.watchdog_stop),
@@ -54,10 +60,12 @@ async def lifespan(app: FastAPI):
         app.state.processor_stop.set()
         app.state.watchdog_stop.set()
         app.state.recompute_stop.set()
+        app.state.publisher_stop.set()
         app.state.processor_task.cancel()
         app.state.watchdog_task.cancel()
         app.state.recompute_task.cancel()
-        for task in (app.state.processor_task, app.state.watchdog_task, app.state.recompute_task):
+        app.state.publisher_task.cancel()
+        for task in (app.state.processor_task, app.state.watchdog_task, app.state.recompute_task, app.state.publisher_task):
             try:
                 await task
             except asyncio.CancelledError:
