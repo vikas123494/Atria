@@ -114,3 +114,42 @@ async def slo(request: Request, limit: int = Query(1000, ge=1, le=10000)):
                 tenant, limit,
             )
     return {"samples": [dict(r) for r in rows]}
+
+
+from datetime import datetime, timezone
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class RenderAck(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    sample_key: str = Field(min_length=1, max_length=128)
+    rendered_at: datetime
+
+
+@router.post("/slo/render-ack", status_code=202)
+async def render_ack(payload: RenderAck, request: Request):
+    tenant = tenant_from_request(request)
+    rendered = payload.rendered_at
+    if rendered.tzinfo is None:
+        raise HTTPException(422, detail={"code": "SCHEMA_VIOLATION"})
+    rendered = rendered.astimezone(timezone.utc)
+    observed = datetime.now(timezone.utc)
+    delay_ms = max(0, int((observed - rendered).total_seconds() * 1000))
+    async with request.app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant)
+            await conn.execute(
+                """INSERT INTO slo_samples
+                   (tenant_id,kind,sample_key,event_ts,observed_ts,delay_ms)
+                   VALUES($1,'dashboard_render', $2, $3, $4, $5)
+                   ON CONFLICT(tenant_id,kind,sample_key,event_ts) DO NOTHING""",
+                tenant, payload.sample_key, rendered, observed, delay_ms,
+            )
+            await conn.execute(
+                """INSERT INTO audit_events
+                   (tenant_id,actor_id,action,resource_type,resource_id,details)
+                   VALUES($1,$2,'slo.render_ack','slo_sample',$3,$4::jsonb)""",
+                tenant, request.state.user_id, payload.sample_key,
+                __import__("json").dumps({"delay_ms": delay_ms}),
+            )
+    return {"accepted": True, "delay_ms": delay_ms}
