@@ -15,9 +15,9 @@ CollectorId = Annotated[str, StringConstraints(pattern=r"^col_[a-z0-9_]{1,32}$")
 Uuid = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")]
 UuidV7 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")]
 Sha256Hash = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
-UtcTimestamp = Annotated[str, StringConstraints(pattern=r"^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$")]
-TimezoneName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z][A-Za-z0-9_+\\-]*(/[A-Za-z0-9_+\\-]+){0,2}$")]
-SafeText = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.:<>=%/ ,()\\-]{1,160}$")]
+UtcTimestamp = Annotated[str, StringConstraints(pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")]
+TimezoneName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z][A-Za-z0-9_+\-]*(/[A-Za-z0-9_+\-]+){0,2}$")]
+SafeText = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.:<>=%/ ,()\-]{1,160}$")]
 Num = Annotated[float, Field(allow_inf_nan=False)]
 ParamValue = Union[int, float]
 
@@ -105,7 +105,7 @@ Record = Annotated[
 ]
 
 class Envelope(StrictModel):
-    schema_version: str = Field(pattern=r"^\\d{1,2}\\.\\d{1,2}$")
+    schema_version: str = Field(pattern=r"^\d{1,2}\.\d{1,2}$")
     payload_id: UuidV7
     tenant_id: TenantId
     collector_id: CollectorId
