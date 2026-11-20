@@ -70,31 +70,39 @@ class StreamProcessor:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant_id)
-                for record in body["records"]:
-                    kind = record["type"]
-                    event_ts = _dt(record["event_ts"])
-                    if kind == "metric":
-                        await self._metric(conn, tenant_id, collector_id, payload_id, record, event_ts)
-                    elif kind == "security_summary":
-                        await conn.execute(
-                            """INSERT INTO security_summaries
-                               (tenant_id,category,severity,count,distinct_principals,
-                                principals,sources,risk_score,event_ts,payload_id)
-                               VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
-                            tenant_id, record["category"], record["severity"], record["count"],
-                            record["distinct_principals"], record["principals"], record["sources"],
-                            record["risk_score"], event_ts, payload_id,
-                        )
-                    elif kind == "alert":
-                        await self._alert(conn, tenant_id, record, event_ts)
-                    elif kind == "health":
-                        await self._health(conn, tenant_id, record, event_ts)
-            # ACK only after the PostgreSQL transaction commits.
-            await self.redis.xack(self.stream, self.group, message_id)
+                claimed = await conn.fetchval(
+                    """INSERT INTO processed_stream_payloads(tenant_id,payload_id)
+                       VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING payload_id""",
+                    tenant_id, payload_id,
+                )
+                # Redis may redeliver after a crash between PG commit and XACK.
+                # This ledger prevents duplicate side effects while allowing the
+                # notification to be republished before the stream entry is ACKed.
+                if claimed:
+                    for record in body["records"]:
+                        kind = record["type"]
+                        event_ts = _dt(record["event_ts"])
+                        if kind == "metric":
+                            await self._metric(conn, tenant_id, collector_id, payload_id, record, event_ts)
+                        elif kind == "security_summary":
+                            await conn.execute(
+                                """INSERT INTO security_summaries
+                                   (tenant_id,category,severity,count,distinct_principals,
+                                    principals,sources,risk_score,event_ts,payload_id)
+                                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
+                                tenant_id, record["category"], record["severity"], record["count"],
+                                record["distinct_principals"], record["principals"], record["sources"],
+                                record["risk_score"], event_ts, payload_id,
+                            )
+                        elif kind == "alert":
+                            await self._alert(conn, tenant_id, record, event_ts)
+                        elif kind == "health":
+                            await self._health(conn, tenant_id, record, event_ts)
         await self.redis.publish(
             f"veilops:tenant:{tenant_id}:events",
             json.dumps({"event": "telemetry_processed", "collector_id": collector_id, "payload_id": str(payload_id)}),
         )
+        await self.redis.xack(self.stream, self.group, message_id)
 
     async def _metric(self, conn, tenant_id, collector_id, payload_id, record, event_ts):
         await conn.execute(
@@ -206,3 +214,72 @@ class StreamProcessor:
                    VALUES($1,$2,$3,$4,$5::jsonb,$6)""",
                 tenant_id, entity, old_state, state, reasons, event_ts,
             )
+
+
+async def stream_outbox_publisher(redis, pool, stream: str, interval_seconds: float = 0.5,
+                                  stop_event=None):
+    """Publish committed ingest outbox rows to Redis Streams, safely retrying failures."""
+    while stop_event is None or not stop_event.is_set():
+        published = False
+        try:
+            async with pool.acquire() as conn:
+                tenants = await conn.fetch("SELECT tenant_id FROM tenants ORDER BY tenant_id")
+            for tenant_row in tenants:
+                tenant_id = tenant_row["tenant_id"]
+                async with pool.acquire() as conn:
+                    async with conn.transaction():
+                        await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant_id)
+                        row = await conn.fetchrow(
+                            """SELECT id,collector_id,payload_id,seq,payload_hash,sent_at,
+                                      received_at,body
+                               FROM ingest_stream_outbox
+                               WHERE tenant_id=$1 AND published_at IS NULL
+                               ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1""",
+                            tenant_id,
+                        )
+                        if row:
+                            body = row["body"]
+                            if not isinstance(body, str):
+                                body = json.dumps(body, separators=(",", ":"))
+                            await redis.xadd(
+                                stream,
+                                {"tenant_id": tenant_id, "collector_id": row["collector_id"],
+                                 "payload_id": str(row["payload_id"]), "seq": str(row["seq"]),
+                                 "payload_hash": row["payload_hash"],
+                                 "sent_at": row["sent_at"].isoformat(),
+                                 "received_at": row["received_at"].isoformat(), "body": body},
+                                maxlen=1_000_000, approximate=True,
+                            )
+                            await conn.execute(
+                                """UPDATE ingest_stream_outbox
+                                   SET published_at=now(),attempts=attempts+1,last_error=NULL
+                                   WHERE id=$1""",
+                                row["id"],
+                            )
+                            published = True
+                if published:
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("ingest outbox publisher failed")
+            try:
+                if row:
+                    async with pool.acquire() as conn:
+                        async with conn.transaction():
+                            await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant_id)
+                            await conn.execute(
+                                """UPDATE ingest_stream_outbox
+                                   SET attempts=attempts+1,last_error=$2 WHERE id=$1""",
+                                row["id"], str(exc)[:1000],
+                            )
+            except Exception:
+                log.exception("could not record ingest outbox publisher failure")
+        if not published:
+            if stop_event is None:
+                await asyncio.sleep(interval_seconds)
+            else:
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+                except asyncio.TimeoutError:
+                    pass
