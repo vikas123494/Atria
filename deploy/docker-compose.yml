@@ -40,7 +40,11 @@ services:
       REDIS_URL: redis://redis:6379/0
       VEILOPS_REGION: ${VEILOPS_REGION:-in}
       INGEST_STREAM: veilops:ingest
-      COLLECTOR_SECRET_ENCRYPTION_KEY: ${COLLECTOR_SECRET_ENCRYPTION_KEY:?Set a URL-safe base64 32-byte key}\n      SAAS_ED25519_PRIVATE_KEY: ${SAAS_ED25519_PRIVATE_KEY:?Set an independent URL-safe base64 32-byte seed}
+      COLLECTOR_SECRET_ENCRYPTION_KEY: ${COLLECTOR_SECRET_ENCRYPTION_KEY:?Set a URL-safe base64 32-byte key}
+      SAAS_ED25519_PRIVATE_KEY: ${SAAS_ED25519_PRIVATE_KEY:?Set an independent URL-safe base64 32-byte seed}
+      DASHBOARD_JWT_SECRET: ${DASHBOARD_JWT_SECRET:?Set a random dashboard JWT signing secret of at least 32 characters}
+      DASHBOARD_JWT_ISSUER: veilops-control
+      DASHBOARD_JWT_AUDIENCE: veilops-dashboard
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
