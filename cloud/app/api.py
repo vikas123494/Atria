@@ -153,3 +153,36 @@ async def render_ack(payload: RenderAck, request: Request):
                 __import__("json").dumps({"delay_ms": delay_ms}),
             )
     return {"accepted": True, "delay_ms": delay_ms}
+
+
+from uuid import UUID
+
+
+@router.get("/payloads/{payload_id}")
+async def payload_receipt(payload_id: UUID, request: Request):
+    tenant = tenant_from_request(request)
+    async with request.app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant)
+            row = await conn.fetchrow(
+                """SELECT payload_id,collector_id,seq,payload_hash,sent_at,received_at
+                   FROM ingest_receipts WHERE tenant_id=$1 AND payload_id=$2""",
+                tenant, payload_id,
+            )
+    if not row:
+        raise HTTPException(404, detail={"code": "PAYLOAD_NOT_FOUND"})
+    return {"receipt": dict(row)}
+
+
+@router.get("/audit")
+async def audit_events(request: Request, limit: int = Query(100, ge=1, le=1000)):
+    tenant = tenant_from_request(request)
+    async with request.app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant)
+            rows = await conn.fetch(
+                """SELECT actor_id,action,resource_type,resource_id,details,at_utc
+                   FROM audit_events WHERE tenant_id=$1 ORDER BY at_utc DESC LIMIT $2""",
+                tenant, limit,
+            )
+    return {"events": [dict(r) for r in rows]}
