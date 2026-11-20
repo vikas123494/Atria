@@ -47,6 +47,10 @@ async def ingest(request: Request):
         pass
 
     redis = request.app.state.redis
+    try:
+        await redis.ping()
+    except Exception as exc:
+        raise HTTPException(503, detail={"code": "STREAM_UNAVAILABLE"}) from exc
     rate_key = f"rate:{auth.collector_id}:{int(now.timestamp()) // 60}"
     count = await redis.incr(rate_key)
     if count == 1:
@@ -103,21 +107,15 @@ async def ingest(request: Request):
                     envelope.tenant_id, str(envelope.payload_id), oldest_event, now, ingest_delay_ms,
                 )
 
-            stream_message = {
-                "tenant_id": envelope.tenant_id,
-                "collector_id": auth.collector_id,
-                "payload_id": str(envelope.payload_id),
-                "seq": str(envelope.seq),
-                "payload_hash": payload_hash,
-                "sent_at": sent_at.isoformat(),
-                "received_at": now.isoformat(),
-                "body": body.decode("utf-8"),
-            }
-            await redis.xadd(
-                request.app.state.settings.ingest_stream,
-                stream_message,
-                maxlen=1_000_000,
-                approximate=True,
+            # Receipt and dispatch intent commit atomically in PostgreSQL.
+            # A background publisher retries Redis delivery after transient failures.
+            await conn.execute(
+                """INSERT INTO ingest_stream_outbox
+                   (tenant_id,collector_id,payload_id,seq,payload_hash,sent_at,received_at,body)
+                   VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+                   ON CONFLICT(tenant_id,payload_id) DO NOTHING""",
+                envelope.tenant_id, auth.collector_id, envelope.payload_id,
+                envelope.seq, payload_hash, sent_at, now, body.decode("utf-8"),
             )
 
     receipt = {
