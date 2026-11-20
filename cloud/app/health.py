@@ -1,9 +1,9 @@
-"""Cloud-side collector/entity health evaluation (Architecture §19).
+"""Deterministic collector/entity health evaluation (Architecture §19).
 
-AIOps anomaly detection and correlation remain owned by Person D.
-This module implements deterministic health state and transition persistence.
+AIOps anomaly detection, correlation and root-cause ranking remain Person D scope.
 """
-from datetime import datetime, timedelta, timezone
+import json
+from datetime import datetime, timezone
 
 
 STATES = ("Excellent", "Good", "Fair", "Poor")
@@ -24,26 +24,33 @@ def heartbeat_state(last_seen: datetime | None, now: datetime | None = None) -> 
 def metric_state(value: float, good: float | None, fair: float | None,
                  poor: float | None, *, higher_is_worse: bool = True) -> str:
     if higher_is_worse:
-        if poor is not None and value >= poor:
+        if poor is not None and value >= float(poor):
             return "Poor"
-        if fair is not None and value >= fair:
+        if fair is not None and value >= float(fair):
             return "Fair"
-        if good is not None and value >= good:
+        if good is not None and value >= float(good):
             return "Good"
     else:
-        if poor is not None and value <= poor:
+        if poor is not None and value <= float(poor):
             return "Poor"
-        if fair is not None and value <= fair:
+        if fair is not None and value <= float(fair):
             return "Fair"
-        if good is not None and value <= good:
+        if good is not None and value <= float(good):
             return "Good"
     return "Excellent"
 
 
 def combine_states(states: list[str]) -> str:
-    if not states:
-        return "Good"
-    return max(states, key=STATES.index)
+    return max(states, key=STATES.index) if states else "Good"
+
+
+def three_of_five_state(window_states: list[str]) -> str:
+    """Promote a degraded band only when at least 3 of the latest 5 windows agree."""
+    recent = window_states[:5]
+    for candidate in ("Poor", "Fair", "Good"):
+        if recent.count(candidate) >= 3:
+            return candidate
+    return "Excellent"
 
 
 async def evaluate_collector_health(pool, tenant_id: str, collector_id: str,
@@ -57,64 +64,92 @@ async def evaluate_collector_health(pool, tenant_id: str, collector_id: str,
                    WHERE tenant_id=$1 AND collector_id=$2""",
                 tenant_id, collector_id,
             )
-            state, reasons = heartbeat_state(last, now)
+            hb_state, hb_reasons = heartbeat_state(last, now)
             entities = await conn.fetch(
                 "SELECT entity FROM entities WHERE tenant_id=$1 AND collector_id=$2",
                 tenant_id, collector_id,
             )
-            for row in entities:
-                entity = row["entity"]
-                previous = await conn.fetchrow(
-                    "SELECT state,since FROM health_current WHERE tenant_id=$1 AND entity=$2 FOR UPDATE",
+            updated = 0
+            for entity_row in entities:
+                entity = entity_row["entity"]
+                metric_rows = await conn.fetch(
+                    """SELECT m.metric,m.avg,m.max,t.good,t.fair,t.poor
+                       FROM metric_points m
+                       LEFT JOIN thresholds t
+                         ON t.tenant_id=m.tenant_id AND t.metric=m.metric
+                       WHERE m.tenant_id=$1 AND m.entity=$2
+                       ORDER BY m.event_ts DESC LIMIT 100""",
                     tenant_id, entity,
                 )
-                # Offline collectors force all their entities to Poor.
-                target = "Poor" if state == "Poor" else state
+                by_metric = {}
+                for row in metric_rows:
+                    by_metric.setdefault(row["metric"], []).append(row)
+                metric_states = []
+                reasons = list(hb_reasons)
+                for metric, samples in by_metric.items():
+                    thresholds = samples[0]
+                    if thresholds["good"] is None and thresholds["fair"] is None and thresholds["poor"] is None:
+                        continue
+                    sample_states = []
+                    for sample in samples[:5]:
+                        value = sample["avg"] if sample["avg"] is not None else sample["max"]
+                        if value is not None:
+                            sample_states.append(metric_state(
+                                float(value), thresholds["good"], thresholds["fair"], thresholds["poor"]
+                            ))
+                    band = three_of_five_state(sample_states)
+                    metric_states.append(band)
+                    if band != "Excellent":
+                        reasons.append(f"{metric}:{band.lower()}")
+                target = combine_states([hb_state, *metric_states])
+                if hb_state == "Poor":
+                    target = "Poor"
+                previous = await conn.fetchrow(
+                    "SELECT state FROM health_current WHERE tenant_id=$1 AND entity=$2 FOR UPDATE",
+                    tenant_id, entity,
+                )
                 if previous is None:
+                    old_state = None
                     await conn.execute(
                         """INSERT INTO health_current
                            (tenant_id,entity,state,reasons,since,last_data_ts)
                            VALUES($1,$2,$3,$4::jsonb,$5,$6)""",
-                        tenant_id, entity, target, __import__("json").dumps(reasons),
-                        now, last,
+                        tenant_id, entity, target, json.dumps(reasons), now, last,
                     )
-                    old = None
                 else:
-                    old = previous["state"]
-                    # Staleness caps: >15s at most Good, >30s at most Fair;
-                    # a fully offline collector is Poor.
+                    old_state = previous["state"]
                     await conn.execute(
                         """UPDATE health_current SET state=$3,reasons=$4::jsonb,
                            since=CASE WHEN state<>$3 THEN $5 ELSE since END,
                            last_data_ts=COALESCE($6,last_data_ts)
                            WHERE tenant_id=$1 AND entity=$2""",
-                        tenant_id, entity, target, __import__("json").dumps(reasons), now, last,
+                        tenant_id, entity, target, json.dumps(reasons), now, last,
                     )
-                if old != target:
+                if old_state != target:
                     await conn.execute(
                         """INSERT INTO health_transitions
                            (tenant_id,entity,from_state,to_state,reasons,at_utc)
                            VALUES($1,$2,$3,$4,$5::jsonb,$6)""",
-                        tenant_id, entity, old, target, __import__("json").dumps(reasons), now,
+                        tenant_id, entity, old_state, target, json.dumps(reasons), now,
                     )
-    return {"collector_id": collector_id, "state": state, "last_heartbeat": last,
-            "entities_updated": len(entities), "reasons": reasons}
+                updated += 1
+    return {"collector_id": collector_id, "state": hb_state, "last_heartbeat": last,
+            "entities_updated": updated, "reasons": hb_reasons}
 
 
 async def watchdog_loop(pool, interval_seconds: int = 5, stop_event=None):
-    """Periodically reevaluate every tenant/collector heartbeat."""
+    """Periodically reevaluate collectors; cancellation is handled by the app lifespan."""
     import asyncio
+    import logging
     while stop_event is None or not stop_event.is_set():
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                """SELECT DISTINCT tenant_id,collector_id FROM collectors
-                   WHERE revoked_at IS NULL"""
+                "SELECT DISTINCT tenant_id,collector_id FROM collectors WHERE revoked_at IS NULL"
             )
         for row in rows:
             try:
                 await evaluate_collector_health(pool, row["tenant_id"], row["collector_id"])
             except Exception:
-                import logging
                 logging.getLogger(__name__).exception("watchdog evaluation failed")
         if stop_event is None:
             await asyncio.sleep(interval_seconds)
