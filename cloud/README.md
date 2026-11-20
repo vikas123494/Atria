@@ -44,3 +44,29 @@ Dashboard APIs require a JWT signed with HS256 using the configured
 `veilops-dashboard`, and claims `sub`, `tenant_id`, and `exp`.
 The control-plane identity provider must issue these tokens; this service
 validates them and does not implement user login or token issuance.
+
+
+## Dashboard, health, reliability and actions
+
+Dashboard endpoints are under `/api/v1` and require a verified tenant JWT.
+Available read endpoints include fleet, collector detail, entity metrics and health
+history, alerts, incidents, recommendations, payload receipts, audit events and SLO
+samples. `POST /api/v1/slo/render-ack` records dashboard render acknowledgements.
+`GET /api/v1/events` streams tenant-scoped updates using Server-Sent Events.
+
+Collector endpoints include authenticated `GET /v1/reconcile` and
+`GET /v1/actions`. Dashboard users can request actions and explicitly approve them;
+collectors can only pull approved, unexpired actions. The API does not execute
+remediation commands itself.
+
+The watchdog evaluates heartbeat age and threshold bands. Threshold degradation
+uses the three-of-five recent-window rule. The deterministic health engine is not
+the AIOps anomaly detector; anomaly detection and topology-aware correlation remain
+Person D responsibilities.
+
+## Operational notes
+
+Migrations are ordered SQL scripts for fresh local database initialization. Existing
+volumes require an explicit migration process; the official Postgres init directory
+does not rerun scripts on an initialized volume. The local Compose credentials are
+demo-only and must be replaced before any shared or production deployment.
