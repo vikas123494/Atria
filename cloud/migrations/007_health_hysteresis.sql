@@ -17,3 +17,5 @@ CREATE POLICY tenant_isolation ON health_metric_current
 
 CREATE INDEX ix_health_metric_current_entity
     ON health_metric_current (tenant_id, entity);
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON health_metric_current TO veilops_app;
