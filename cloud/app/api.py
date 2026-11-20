@@ -50,7 +50,22 @@ async def fleet(request: Request):
                    GROUP BY c.collector_id,c.region,c.status ORDER BY c.collector_id""",
                 tenant,
             )
-    return {"tenant_id": tenant, "collectors": [dict(r) for r in rows]}
+    async with request.app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant)
+            entity_rows = await conn.fetch(
+                """SELECT e.entity,e.kind,e.environment,e.collector_id,
+                          h.state,h.reasons,h.since,h.last_data_ts
+                   FROM entities e LEFT JOIN health_current h
+                     ON h.tenant_id=e.tenant_id AND h.entity=e.entity
+                   WHERE e.tenant_id=$1 ORDER BY e.environment,e.entity""",
+                tenant,
+            )
+    return {
+        "tenant_id": tenant,
+        "collectors": [dict(r) for r in rows],
+        "entities": [dict(r) for r in entity_rows],
+    }
 
 
 @router.get("/collectors/{collector_id}")
@@ -106,7 +121,8 @@ async def health_history(entity: str, request: Request, limit: int = Query(100, 
 
 
 @router.get("/alerts")
-async def alerts(request: Request, limit: int = Query(100, ge=1, le=1000)):
+async def alerts(request: Request, status: str | None = None, severity: str | None = None,
+                 since: datetime | None = None, limit: int = Query(100, ge=1, le=1000)):
     tenant = tenant_from_request(request)
     async with request.app.state.db_pool.acquire() as conn:
         async with conn.transaction():
@@ -114,8 +130,12 @@ async def alerts(request: Request, limit: int = Query(100, ge=1, le=1000)):
             rows = await conn.fetch(
                 """SELECT alert_id,entity,rule,severity,status,first_ts,last_ts,
                           occurrences,context FROM alerts
-                   WHERE tenant_id=$1 ORDER BY last_ts DESC LIMIT $2""",
-                tenant, limit,
+                   WHERE tenant_id=$1
+                     AND ($2::text IS NULL OR status=$2)
+                     AND ($3::text IS NULL OR severity=$3)
+                     AND ($4::timestamptz IS NULL OR last_ts >= $4)
+                   ORDER BY last_ts DESC LIMIT $5""",
+                tenant, status, severity, since, limit,
             )
     return {"alerts": [dict(r) for r in rows]}
 
@@ -308,3 +328,63 @@ async def update_thresholds(metric: str, payload: ThresholdUpdate, request: Requ
                 json.dumps(payload.model_dump()),
             )
     return {"metric": metric, **payload.model_dump(), "updated": True}
+
+
+@router.get("/incidents")
+async def incidents(request: Request, status: str | None = None,
+                    limit: int = Query(100, ge=1, le=1000)):
+    tenant = tenant_from_request(request)
+    async with request.app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant)
+            rows = await conn.fetch(
+                """SELECT incident_id,title,severity,status,summary,opened_at,updated_at,closed_at
+                   FROM incidents WHERE tenant_id=$1 AND ($2::text IS NULL OR status=$2)
+                   ORDER BY updated_at DESC LIMIT $3""",
+                tenant, status, limit,
+            )
+    return {"incidents": [dict(row) for row in rows]}
+
+
+@router.get("/incidents/{incident_id}")
+async def incident_detail(incident_id: UUID, request: Request):
+    tenant = tenant_from_request(request)
+    async with request.app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant)
+            row = await conn.fetchrow(
+                """SELECT incident_id,title,severity,status,summary,opened_at,updated_at,closed_at
+                   FROM incidents WHERE tenant_id=$1 AND incident_id=$2""",
+                tenant, incident_id,
+            )
+            if not row:
+                raise HTTPException(404, detail={"code": "INCIDENT_NOT_FOUND"})
+            links = await conn.fetch(
+                """SELECT recommendation_id,payload_id,evidence_type,reference
+                   FROM evidence_links WHERE tenant_id=$1 AND incident_id=$2
+                   ORDER BY created_at""",
+                tenant, incident_id,
+            )
+    return {"incident": dict(row), "evidence_links": [dict(item) for item in links]}
+
+
+@router.get("/recommendations/{recommendation_id}")
+async def recommendation_detail(recommendation_id: UUID, request: Request):
+    tenant = tenant_from_request(request)
+    async with request.app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant)
+            row = await conn.fetchrow(
+                """SELECT recommendation_id,incident_id,title,rationale,confidence,status,evidence,created_at
+                   FROM recommendations WHERE tenant_id=$1 AND recommendation_id=$2""",
+                tenant, recommendation_id,
+            )
+            if not row:
+                raise HTTPException(404, detail={"code": "RECOMMENDATION_NOT_FOUND"})
+            links = await conn.fetch(
+                """SELECT payload_id,evidence_type,reference
+                   FROM evidence_links WHERE tenant_id=$1 AND recommendation_id=$2
+                   ORDER BY created_at""",
+                tenant, recommendation_id,
+            )
+    return {"recommendation": dict(row), "evidence_links": [dict(item) for item in links]}
