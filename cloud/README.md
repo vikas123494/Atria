@@ -128,3 +128,33 @@ For HTTPS, add `--profile edge` after the domain points to that host and the ACM
 email is configured. Use a separate EU database and Redis deployment; do not point
 EU tenants at the India region's storage. The placeholder `.example` and
 `.invalid` addresses must never be used as real deployment endpoints.
+
+
+## Late-event recomputation worker
+
+When a metric arrives behind the five-minute watermark, the processor persists the
+metric point and inserts a durable work item in `late_metric_recomputations`.
+The background worker claims pending work with row-level locking
+(`FOR UPDATE SKIP LOCKED`), reruns the entity health evaluator against the
+event-time-ordered metric history, and marks the work item complete. Failed jobs
+are released for retry and retain a bounded error message and attempt count.
+The queue is tenant-RLS protected.
+
+## End-to-end SLO instrumentation
+
+The dashboard must call `POST /api/v1/slo/render-ack` after rendering data and
+include `sample_key`, `rendered_at`, and `source_event_ts`. The backend records
+elapsed time from the source event timestamp to receipt of the render acknowledgement
+as `collection_to_dashboard`. This measures the end-to-end path only when the
+frontend passes the timestamp of the actual displayed source data.
+
+The watchdog records `collector_offline_detection` when it first observes a
+collector whose heartbeat age has reached the Poor/offline threshold. The
+reconciliation endpoint records the number of missing sequence numbers per checked
+range as `reconciliation_missing_sequences`. Duplicate collector sequence
+numbers are rejected by the database unique constraint on `(collector_id, seq)`.
+
+The Judge Mode report calculates p95 for the latency samples and p95 for the
+missing-sequence count (where zero is the target). It reports insufficient data
+until real samples exist; duplicate prevention is reported as a database-enforced
+invariant rather than a fabricated measured rate.
