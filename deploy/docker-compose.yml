@@ -40,7 +40,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       VEILOPS_REGION: ${VEILOPS_REGION:-in}
       INGEST_STREAM: veilops:ingest
-      COLLECTOR_SECRET_ENCRYPTION_KEY: ${COLLECTOR_SECRET_ENCRYPTION_KEY:?Set a URL-safe base64 32-byte key}
+      COLLECTOR_SECRET_ENCRYPTION_KEY: ${COLLECTOR_SECRET_ENCRYPTION_KEY:?Set a URL-safe base64 32-byte key}\n      SAAS_ED25519_PRIVATE_KEY: ${SAAS_ED25519_PRIVATE_KEY:?Set an independent URL-safe base64 32-byte seed}
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
