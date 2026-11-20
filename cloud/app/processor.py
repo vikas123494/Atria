@@ -109,6 +109,15 @@ class StreamProcessor:
         )
 
     async def _alert(self, conn, tenant_id, record, event_ts):
+        observed = datetime.now(timezone.utc)
+        delay_ms = max(0, int((observed - event_ts).total_seconds() * 1000))
+        await conn.execute(
+            """INSERT INTO slo_samples
+               (tenant_id,kind,sample_key,event_ts,observed_ts,delay_ms)
+               VALUES($1,'threshold_to_alert',$2,$3,$4,$5)
+               ON CONFLICT DO NOTHING""",
+            tenant_id, str(record["alert_id"]), event_ts, observed, delay_ms,
+        )
         fingerprint = f'{tenant_id}:{record["entity"]}:{record["rule"]}:{record["template_id"]}'
         context = json.dumps({"template_id": record["template_id"], "params": record["params"]})
         await conn.execute(
