@@ -1,7 +1,7 @@
 """Wire contracts aligned with the team's veilops/schema package (docs/CONTRACTS.md §6)."""
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 # Match veilops/schema/common.py: strict, immutable models and the same safe wire types.
 class StrictModel(BaseModel):
@@ -114,8 +114,23 @@ class Envelope(StrictModel):
     sent_at: UtcTimestamp
     policy: PolicyRef
     chain: ChainRef
-    records: list[Record] = Field(min_length=1, max_length=500)
+    records: list[dict] = Field(min_length=1, max_length=500)
 
-    def model_dump_records(self) -> list[dict]:
-        """Return wire records as JSON-compatible dictionaries for Redis/Postgres."""
-        return [record.model_dump(mode="json") for record in self.records]
+    @model_validator(mode="after")
+    def validate_and_normalize_records(self):
+        allowed = {
+            "metric": MetricRecord,
+            "security_summary": SecuritySummaryRecord,
+            "alert": AlertRecord,
+            "health": HealthRecord,
+            "topology": TopologyRecord,
+        }
+        normalized = []
+        for item in self.records:
+            kind = item.get("type") if isinstance(item, dict) else None
+            model = allowed.get(kind)
+            if model is None:
+                raise ValueError(f"UNKNOWN_RECORD_TYPE: {kind!r}")
+            normalized.append(model.model_validate(item).model_dump(mode="json"))
+        object.__setattr__(self, "records", normalized)
+        return self

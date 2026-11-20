@@ -93,7 +93,7 @@ async def ingest(request: Request):
                 raise
 
             event_times = [
-                datetime.fromisoformat(record.event_ts.replace("Z", "+00:00"))
+                datetime.fromisoformat(record["event_ts"].replace("Z", "+00:00"))
                 for record in envelope.records
             ]
             if event_times:

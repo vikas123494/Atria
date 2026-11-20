@@ -29,7 +29,7 @@ def test_team_metric_record_validates_without_coercion():
         "event_ts": "2026-11-20T12:00:00.000Z", "source_tz": "Asia/Kolkata",
     }
     parsed = Envelope.model_validate(envelope_with(record))
-    assert parsed.records[0].metric == "cpu.util_pct"
+    assert parsed.records[0]["metric"] == "cpu.util_pct"
 
 
 def test_team_alert_accepts_high_severity_and_numeric_params():
@@ -61,7 +61,7 @@ def test_team_topology_record_is_accepted():
         "event_ts": "2026-11-20T12:00:00.000Z",
     }
     parsed = Envelope.model_validate(envelope_with(record))
-    assert parsed.records[0].edges[0].rel == "runs_on"
+    assert parsed.records[0]["edges"][0]["rel"] == "runs_on"
 
 
 def test_unknown_record_and_non_pseudonymous_entity_are_rejected():
