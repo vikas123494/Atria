@@ -1,12 +1,12 @@
 """VeilOps regional Cloud Core API."""
-from contextlib import asynccontextmanager
+import asyncio\nfrom contextlib import asynccontextmanager
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, Request
 from redis.asyncio import Redis
 
 from cloud.app.crypto import ReceiptSigner, SecretBox\nfrom cloud.app.control import router as control_router
-from cloud.app.ingest import router as ingest_router
+from cloud.app.ingest import router as ingest_router\nfrom cloud.app.processor import StreamProcessor
 from cloud.app.settings import Settings
 
 
@@ -23,9 +23,22 @@ async def lifespan(app: FastAPI):
         settings.redis_url, encoding="utf-8", decode_responses=True,
         socket_connect_timeout=2, socket_timeout=2,
     )
+    app.state.processor_stop = asyncio.Event()
+    processor = StreamProcessor(
+        app.state.redis, app.state.db_pool, settings.ingest_stream
+    )
+    app.state.processor_task = asyncio.create_task(
+        processor.run(app.state.processor_stop), name="veilops-stream-writer"
+    )
     try:
         yield
     finally:
+        app.state.processor_stop.set()
+        app.state.processor_task.cancel()
+        try:
+            await app.state.processor_task
+        except asyncio.CancelledError:
+            pass
         await app.state.redis.aclose()
         await app.state.db_pool.close()
 
