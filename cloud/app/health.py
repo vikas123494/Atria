@@ -5,7 +5,6 @@ AIOps anomaly detection, correlation and root-cause ranking remain Person D scop
 import json
 from datetime import datetime, timezone
 
-
 STATES = ("Excellent", "Good", "Fair", "Poor")
 
 
@@ -45,12 +44,40 @@ def combine_states(states: list[str]) -> str:
 
 
 def three_of_five_state(window_states: list[str]) -> str:
-    """Promote a degraded band only when at least 3 of the latest 5 windows agree."""
+    """Return a degraded state only when it appears in at least 3 of 5 windows."""
     recent = window_states[:5]
     for candidate in ("Poor", "Fair", "Good"):
         if recent.count(candidate) >= 3:
             return candidate
     return "Excellent"
+
+
+def recovered_inside_margin(values: list[float], target: str, good, fair, poor,
+                             margin: float = 0.10) -> bool:
+    """Require 3 consecutive samples 10% inside the boundary for an improved state."""
+    if len(values) < 3:
+        return False
+    boundary = {"Excellent": good, "Good": fair, "Fair": poor}.get(target)
+    if boundary is None:
+        return target == "Poor"
+    boundary = float(boundary)
+    # VeilOps' configured metric thresholds use higher-is-worse semantics.
+    return all(value <= boundary * (1.0 - margin) for value in values[:3])
+
+
+def cap_for_stale_metrics(state: str, last_metric_ts: datetime | None,
+                          now: datetime) -> tuple[str, list[str]]:
+    """Stale metric data may not look healthier than the architecture permits."""
+    if last_metric_ts is None:
+        return "Fair" if STATES.index(state) < STATES.index("Fair") else state, ["no_metric_data"]
+    age = max(0.0, (now - last_metric_ts).total_seconds())
+    if age > 30:
+        return ("Fair" if STATES.index(state) < STATES.index("Fair") else state,
+                ["metric_data_stale_30s"])
+    if age > 15:
+        return ("Good" if STATES.index(state) < STATES.index("Good") else state,
+                ["metric_data_stale_15s"])
+    return state, []
 
 
 async def evaluate_collector_health(pool, tenant_id: str, collector_id: str,
@@ -73,7 +100,7 @@ async def evaluate_collector_health(pool, tenant_id: str, collector_id: str,
             for entity_row in entities:
                 entity = entity_row["entity"]
                 metric_rows = await conn.fetch(
-                    """SELECT m.metric,m.avg,m.max,t.good,t.fair,t.poor
+                    """SELECT m.metric,m.avg,m.max,m.event_ts,t.good,t.fair,t.poor
                        FROM metric_points m
                        LEFT JOIN thresholds t
                          ON t.tenant_id=m.tenant_id AND t.metric=m.metric
@@ -86,24 +113,51 @@ async def evaluate_collector_health(pool, tenant_id: str, collector_id: str,
                     by_metric.setdefault(row["metric"], []).append(row)
                 metric_states = []
                 reasons = list(hb_reasons)
+                latest_metric_ts = max((r["event_ts"] for r in metric_rows), default=None)
+
                 for metric, samples in by_metric.items():
                     thresholds = samples[0]
-                    if thresholds["good"] is None and thresholds["fair"] is None and thresholds["poor"] is None:
+                    good, fair, poor = thresholds["good"], thresholds["fair"], thresholds["poor"]
+                    if good is None and fair is None and poor is None:
                         continue
-                    sample_states = []
-                    for sample in samples[:5]:
-                        value = sample["avg"] if sample["avg"] is not None else sample["max"]
-                        if value is not None:
-                            sample_states.append(metric_state(
-                                float(value), thresholds["good"], thresholds["fair"], thresholds["poor"]
-                            ))
-                    band = three_of_five_state(sample_states)
-                    metric_states.append(band)
-                    if band != "Excellent":
-                        reasons.append(f"{metric}:{band.lower()}")
+                    values = [
+                        float(row["avg"] if row["avg"] is not None else row["max"])
+                        for row in samples
+                        if row["avg"] is not None or row["max"] is not None
+                    ]
+                    sample_states = [
+                        metric_state(value, good, fair, poor) for value in values[:5]
+                    ]
+                    candidate = three_of_five_state(sample_states)
+                    prior = await conn.fetchrow(
+                        """SELECT state FROM health_metric_current
+                           WHERE tenant_id=$1 AND entity=$2 AND metric=$3 FOR UPDATE""",
+                        tenant_id, entity, metric,
+                    )
+                    previous_metric_state = prior["state"] if prior else None
+                    if (previous_metric_state is not None
+                            and STATES.index(candidate) < STATES.index(previous_metric_state)
+                            and not recovered_inside_margin(values, candidate, good, fair, poor)):
+                        candidate = previous_metric_state
+                        reasons.append(f"{metric}:recovery_hysteresis_pending")
+                    await conn.execute(
+                        """INSERT INTO health_metric_current
+                           (tenant_id,entity,metric,state,updated_at)
+                           VALUES($1,$2,$3,$4,$5)
+                           ON CONFLICT(tenant_id,entity,metric) DO UPDATE
+                           SET state=EXCLUDED.state,updated_at=EXCLUDED.updated_at""",
+                        tenant_id, entity, metric, candidate, now,
+                    )
+                    metric_states.append(candidate)
+                    if candidate != "Excellent":
+                        reasons.append(f"{metric}:{candidate.lower()}")
+
                 target = combine_states([hb_state, *metric_states])
+                target, stale_reasons = cap_for_stale_metrics(target, latest_metric_ts, now)
+                reasons.extend(stale_reasons)
                 if hb_state == "Poor":
                     target = "Poor"
+
                 previous = await conn.fetchrow(
                     "SELECT state FROM health_current WHERE tenant_id=$1 AND entity=$2 FOR UPDATE",
                     tenant_id, entity,
@@ -114,7 +168,7 @@ async def evaluate_collector_health(pool, tenant_id: str, collector_id: str,
                         """INSERT INTO health_current
                            (tenant_id,entity,state,reasons,since,last_data_ts)
                            VALUES($1,$2,$3,$4::jsonb,$5,$6)""",
-                        tenant_id, entity, target, json.dumps(reasons), now, last,
+                        tenant_id, entity, target, json.dumps(reasons), now, latest_metric_ts,
                     )
                 else:
                     old_state = previous["state"]
@@ -123,7 +177,7 @@ async def evaluate_collector_health(pool, tenant_id: str, collector_id: str,
                            since=CASE WHEN state<>$3 THEN $5 ELSE since END,
                            last_data_ts=COALESCE($6,last_data_ts)
                            WHERE tenant_id=$1 AND entity=$2""",
-                        tenant_id, entity, target, json.dumps(reasons), now, last,
+                        tenant_id, entity, target, json.dumps(reasons), now, latest_metric_ts,
                     )
                 if old_state != target:
                     await conn.execute(
