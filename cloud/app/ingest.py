@@ -3,7 +3,8 @@ import hashlib
 import json
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Request, Response\nfrom fastapi.responses import JSONResponse
+from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from cloud.app.contracts import Envelope
