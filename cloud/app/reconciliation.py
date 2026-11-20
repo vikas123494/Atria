@@ -27,6 +27,15 @@ async def reconcile(request: Request, collector_id: str,
         )
     received = {row["seq"] for row in rows}
     missing = [seq for seq in range(from_seq, to_seq + 1) if seq not in received]
+    observed = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    await conn.execute(
+        """INSERT INTO slo_samples
+           (tenant_id,kind,sample_key,event_ts,observed_ts,delay_ms)
+           VALUES($1,'reconciliation_missing_sequences',$2,$3,$3,$4)
+           ON CONFLICT DO NOTHING""",
+        collector["tenant_id"], f"{collector_id}:{from_seq}:{to_seq}",
+        observed, len(missing),
+    )
     return {
         "collector_id": collector_id, "tenant_id": collector["tenant_id"],
         "from_seq": from_seq, "to_seq": to_seq,
