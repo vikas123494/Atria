@@ -142,7 +142,14 @@ class StreamProcessor:
             record["count"], payload_id, is_late, watermark_ts,
         )
         if is_late:
-            log.info("Stored late metric event for recomputation: tenant=%s entity=%s metric=%s event_ts=%s watermark=%s",
+            await conn.execute(
+                """INSERT INTO late_metric_recomputations
+                   (tenant_id,entity,metric,event_ts)
+                   VALUES($1,$2,$3,$4)
+                   ON CONFLICT(tenant_id,entity,metric,event_ts) DO NOTHING""",
+                tenant_id, record["entity"], record["metric"], event_ts,
+            )
+            log.info("Stored late metric event and queued health recomputation: tenant=%s entity=%s metric=%s event_ts=%s watermark=%s",
                      tenant_id, record["entity"], record["metric"], event_ts, watermark_ts)
 
     async def _alert(self, conn, tenant_id, record, event_ts):
