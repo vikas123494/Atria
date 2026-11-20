@@ -83,6 +83,10 @@ class StreamProcessor:
                         await self._health(conn, tenant_id, record, event_ts)
             # ACK only after the PostgreSQL transaction commits.
             await self.redis.xack(self.stream, self.group, message_id)
+        await self.redis.publish(
+            f"veilops:tenant:{tenant_id}:events",
+            json.dumps({"event": "telemetry_processed", "collector_id": collector_id, "payload_id": str(payload_id)}),
+        )
 
     async def _metric(self, conn, tenant_id, collector_id, payload_id, record, event_ts):
         await conn.execute(
