@@ -7,9 +7,10 @@ from cloud.app.health import (
 
 def test_heartbeat_health_thresholds():
     now = datetime.now(timezone.utc)
-    assert heartbeat_state(now, now)[0] == "Good"
+    assert heartbeat_state(now, now)[0] == "Excellent"
     assert heartbeat_state(now - timedelta(seconds=15), now)[0] == "Fair"
-    assert heartbeat_state(now - timedelta(seconds=30), now)[0] == "Poor"
+    assert heartbeat_state(now - timedelta(seconds=30), now)[0] == "Fair"
+    assert heartbeat_state(now - timedelta(seconds=31), now)[0] == "Poor"
     assert heartbeat_state(None, now)[0] == "Poor"
 
 

@@ -268,7 +268,7 @@ async def late_metric_recompute_loop(pool, interval_seconds: int = 2, stop_event
                                WHERE q.tenant_id=$1 AND q.processed_at IS NULL
                                  AND (q.claimed_at IS NULL OR q.claimed_at < now() - INTERVAL '2 minutes')
                                ORDER BY q.queued_at
-                               FOR UPDATE OF q SKIP LOCKED LIMIT 1""",
+                               LIMIT 1 FOR UPDATE OF q SKIP LOCKED""",
                             tenant_id,
                         )
                         if item:
