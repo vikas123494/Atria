@@ -32,12 +32,14 @@ This implementation stores an Argon2 verifier hash and AES-GCM-encrypted key
 material. The AES key is supplied through `COLLECTOR_SECRET_ENCRYPTION_KEY`;
 production must use KMS/HSM-backed key management and rotation.
 
-## Scope status
+## Scope and verification status
 
-Enrollment, Ed25519 receipt signing, durable stream publishing/outbox recovery,
-dashboard JWT/RBAC, health processing, reconciliation, EU deployment and Judge Mode
-remain subsequent implementation milestones. Do not represent them as implemented
-until their code and tests are merged.
+The branch includes enrollment, Ed25519 receipt signing, Redis Streams processing,
+dashboard JWT tenant scoping, health evaluation/watchdog, reconciliation, action
+approval/pull, event-time watermark metadata, Judge Mode reporting and an optional
+Caddy TLS edge proxy. This is a development implementation, not a production
+certification. End-to-end collection-to-dashboard p95, offline-detection SLO and
+reconciliation loss/duplicate SLO are currently reported as not instrumented.
 
 Dashboard APIs require a JWT signed with HS256 using the configured
 `DASHBOARD_JWT_SECRET`, issuer `veilops-control`, audience
@@ -110,3 +112,19 @@ The event-time watermark migration adds columns to `metric_points` and creates
 the RLS-protected `event_time_watermarks` table. As with the other migrations,
 it is automatically applied only when PostgreSQL initializes a fresh volume;
 existing deployments need a controlled migration run.
+
+
+## Separate EU regional deployment
+
+The EU example file is a template, not a live EU endpoint. On a separate EU host,
+copy `deploy/region-eu.env.example` to a protected `.env`, replace all placeholders
+with region-specific secrets and a real EU DNS name, then run:
+
+```bash
+docker compose --env-file .env -p veilops-eu -f deploy/docker-compose.yml up -d --build
+```
+
+For HTTPS, add `--profile edge` after the domain points to that host and the ACME
+email is configured. Use a separate EU database and Redis deployment; do not point
+EU tenants at the India region's storage. The placeholder `.example` and
+`.invalid` addresses must never be used as real deployment endpoints.
