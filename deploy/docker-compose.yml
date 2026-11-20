@@ -53,6 +53,25 @@ services:
       redis:
         condition: service_healthy
 
+
+  caddy:
+    image: caddy:2
+    profiles: ["edge"]
+    environment:
+      VEILOPS_DOMAIN: ${VEILOPS_DOMAIN:?Set VEILOPS_DOMAIN to a DNS name pointing at this host}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - cloud-api
+
 volumes:
   postgres_data:
   redis_data:
+  caddy_data:
+  caddy_config:
