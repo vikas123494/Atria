@@ -2,7 +2,9 @@
 
 AIOps anomaly detection, correlation and root-cause ranking remain Person D scope.
 """
+import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 
 STATES = ("Excellent", "Good", "Fair", "Poor")
@@ -212,3 +214,77 @@ async def watchdog_loop(pool, interval_seconds: int = 5, stop_event=None):
                 await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
             except asyncio.TimeoutError:
                 pass
+
+
+async def late_metric_recompute_loop(pool, interval_seconds: int = 2, stop_event=None):
+    """Re-evaluate an entity after late telemetry is durably queued.
+
+    The normal health evaluator reads the newest event-time ordered samples,
+    so rerunning it after a late insert recomputes the affected health state
+    using the corrected event-time history.
+    """
+    while stop_event is None or not stop_event.is_set():
+        item = None
+        try:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    item = await conn.fetchrow(
+                        """SELECT q.id,q.tenant_id,q.entity,e.collector_id
+                           FROM late_metric_recomputations q
+                           JOIN entities e
+                             ON e.tenant_id=q.tenant_id AND e.entity=q.entity
+                           WHERE q.processed_at IS NULL
+                             AND (q.claimed_at IS NULL OR q.claimed_at < now() - INTERVAL '2 minutes')
+                           ORDER BY q.queued_at
+                           FOR UPDATE OF q SKIP LOCKED LIMIT 1"""
+                    )
+                    if item:
+                        await conn.execute(
+                            """UPDATE late_metric_recomputations
+                               SET claimed_at=now(),attempts=attempts+1,last_error=NULL
+                               WHERE id=$1""",
+                            item["id"],
+                        )
+            if item:
+                await evaluate_collector_health(
+                    pool, item["tenant_id"], item["collector_id"]
+                )
+                async with pool.acquire() as conn:
+                    async with conn.transaction():
+                        await conn.execute(
+                            "SELECT set_config('app.tenant_id',$1,true)", item["tenant_id"]
+                        )
+                        await conn.execute(
+                            """UPDATE late_metric_recomputations
+                               SET processed_at=now(),claimed_at=NULL,last_error=NULL
+                               WHERE id=$1""",
+                            item["id"],
+                        )
+            else:
+                if stop_event is None:
+                    await asyncio.sleep(interval_seconds)
+                else:
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+                    except asyncio.TimeoutError:
+                        pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.getLogger(__name__).exception("late metric recomputation failed")
+            if item:
+                try:
+                    async with pool.acquire() as conn:
+                        async with conn.transaction():
+                            await conn.execute(
+                                "SELECT set_config('app.tenant_id',$1,true)", item["tenant_id"]
+                            )
+                            await conn.execute(
+                                """UPDATE late_metric_recomputations
+                                   SET claimed_at=NULL,last_error=$2
+                                   WHERE id=$1""",
+                                item["id"], str(exc)[:1000],
+                            )
+                except Exception:
+                    logging.getLogger(__name__).exception("could not release recompute claim")
+            await asyncio.sleep(interval_seconds)
