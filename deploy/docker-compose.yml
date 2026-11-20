@@ -36,7 +36,7 @@ services:
       context: ..
       dockerfile: cloud/Dockerfile
     environment:
-      DATABASE_URL: postgresql://veilops:${POSTGRES_PASSWORD:-veilops_dev_only}@postgres:5432/veilops
+      DATABASE_URL: postgresql://veilops_app:veilops_app_dev_only@postgres:5432/veilops
       REDIS_URL: redis://redis:6379/0
     ports:
       - "127.0.0.1:8000:8000"
