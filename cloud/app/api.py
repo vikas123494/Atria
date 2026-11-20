@@ -1,6 +1,9 @@
 """Tenant-scoped dashboard and operational APIs (Person C backend scope)."""
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
+from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, ConfigDict, Field
 
 router = APIRouter(prefix="/api/v1", tags=["dashboard-api"])
 
@@ -11,6 +14,21 @@ def tenant_from_request(request: Request) -> str:
     if not tenant_id:
         raise HTTPException(401, detail={"code": "UNAUTHENTICATED"})
     return tenant_id
+
+
+async def require_role(request: Request, allowed: set[str]) -> str:
+    tenant = tenant_from_request(request)
+    async with request.app.state.db_pool.acquire() as conn:
+        role = await conn.fetchval(
+            "SELECT role FROM memberships WHERE user_id=$1 AND tenant_id=$2",
+            str(request.state.user_id), tenant,
+        )
+    if role is None:
+        raise HTTPException(403, detail={"code": "TENANT_MEMBERSHIP_REQUIRED"})
+    if role not in allowed:
+        raise HTTPException(403, detail={"code": "INSUFFICIENT_ROLE", "required": sorted(allowed)})
+    request.state.tenant_role = role
+    return tenant
 
 
 @router.get("/fleet")
@@ -116,10 +134,6 @@ async def slo(request: Request, limit: int = Query(1000, ge=1, le=10000)):
     return {"samples": [dict(r) for r in rows]}
 
 
-from datetime import datetime, timezone
-from pydantic import BaseModel, ConfigDict, Field
-
-
 class RenderAck(BaseModel):
     model_config = ConfigDict(extra="forbid")
     sample_key: str = Field(min_length=1, max_length=128)
@@ -138,7 +152,7 @@ async def render_ack(payload: RenderAck, request: Request):
     source_event = source_event.astimezone(timezone.utc)
     observed = datetime.now(timezone.utc)
     # End-to-end elapsed time from source event time to receipt of browser render acknowledgement.
-    delay_ms = max(0, int((observed - source_event).total_seconds() * 1000))
+    delay_ms = max(0, int((rendered - source_event).total_seconds() * 1000))
     async with request.app.state.db_pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant)
@@ -154,12 +168,9 @@ async def render_ack(payload: RenderAck, request: Request):
                    (tenant_id,actor_id,action,resource_type,resource_id,details)
                    VALUES($1,$2,'slo.render_ack','slo_sample',$3,$4::jsonb)""",
                 tenant, request.state.user_id, payload.sample_key,
-                __import__("json").dumps({"delay_ms": delay_ms, "rendered_at": rendered.isoformat(), "source_event_ts": source_event.isoformat()}),
+                json.dumps({"delay_ms": delay_ms, "rendered_at": rendered.isoformat(), "source_event_ts": source_event.isoformat(), "ack_received_at": observed.isoformat()}),
             )
     return {"accepted": True, "delay_ms": delay_ms}
-
-
-from uuid import UUID
 
 
 @router.get("/payloads/{payload_id}")
@@ -194,68 +205,106 @@ async def audit_events(request: Request, limit: int = Query(100, ge=1, le=1000))
 
 @router.get("/slo/judge-mode")
 async def judge_mode_slo(request: Request):
-    """Return measured SLOs and explicitly identify metrics not yet instrumented."""
+    """Return rolling five-minute and since-start SLO measurements."""
     tenant = tenant_from_request(request)
     async with request.app.state.db_pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant)
             rows = await conn.fetch(
-                """SELECT kind, count(*) AS sample_count,
-                          percentile_cont(0.95) WITHIN GROUP (ORDER BY delay_ms) AS p95_ms,
+                """SELECT kind,
+                          count(*) FILTER (WHERE event_ts >= now() - INTERVAL '5 minutes') AS recent_count,
+                          percentile_cont(0.50) WITHIN GROUP (ORDER BY delay_ms)
+                            FILTER (WHERE event_ts >= now() - INTERVAL '5 minutes') AS recent_p50_ms,
+                          percentile_cont(0.95) WITHIN GROUP (ORDER BY delay_ms)
+                            FILTER (WHERE event_ts >= now() - INTERVAL '5 minutes') AS recent_p95_ms,
+                          max(delay_ms) FILTER (WHERE event_ts >= now() - INTERVAL '5 minutes') AS recent_max_ms,
+                          count(*) AS total_count,
+                          percentile_cont(0.95) WITHIN GROUP (ORDER BY delay_ms) AS lifetime_p95_ms,
                           max(observed_ts) AS latest_sample
-                   FROM slo_samples
-                   WHERE tenant_id=$1 AND event_ts >= now() - INTERVAL '24 hours'
-                   GROUP BY kind ORDER BY kind""",
+                   FROM slo_samples WHERE tenant_id=$1 GROUP BY kind ORDER BY kind""",
                 tenant,
             )
-    measured = {row["kind"]: {
-        "sample_count": row["sample_count"],
-        "p95_ms": float(row["p95_ms"]) if row["p95_ms"] is not None else None,
-        "latest_sample": row["latest_sample"],
-    } for row in rows}
-
-    alert = measured.get("threshold_to_alert")
-    alert_p95 = alert["p95_ms"] if alert else None
-    dashboard = measured.get("collection_to_dashboard")
-    dashboard_p95 = dashboard["p95_ms"] if dashboard else None
-    offline = measured.get("collector_offline_detection")
-    offline_p95 = offline["p95_ms"] if offline else None
-    reconciliation = measured.get("reconciliation_missing_sequences")
-    reconciliation_p95 = reconciliation["p95_ms"] if reconciliation else None
+    measured = {}
+    for row in rows:
+        measured[row["kind"]] = {
+            "recent_5m": {
+                "sample_count": row["recent_count"],
+                "p50_ms": float(row["recent_p50_ms"]) if row["recent_p50_ms"] is not None else None,
+                "p95_ms": float(row["recent_p95_ms"]) if row["recent_p95_ms"] is not None else None,
+                "max_ms": row["recent_max_ms"],
+            },
+            "since_start": {
+                "sample_count": row["total_count"],
+                "p95_ms": float(row["lifetime_p95_ms"]) if row["lifetime_p95_ms"] is not None else None,
+            },
+            "latest_sample": row["latest_sample"],
+        }
+    def p95(kind):
+        item = measured.get(kind, {}).get("recent_5m", {}).get("p95_ms")
+        return item
+    def evaluate(kind, target):
+        value = p95(kind)
+        return "insufficient_data" if value is None else ("pass" if value <= target else "fail")
+    rec = measured.get("reconciliation_missing_sequences", {}).get("recent_5m", {})
+    rec_count = rec.get("sample_count", 0)
+    rec_max = rec.get("max_ms")
     return {
-        "window": "24h",
+        "window": "rolling_5m_and_since_start",
         "targets": {
             "collection_to_dashboard_p95_ms": 10000,
             "threshold_to_alert_p95_ms": 15000,
             "collector_offline_detection_ms": 60000,
-            "reconciliation_loss": 0,
+            "reconciliation_missing_sequences": 0,
             "reconciliation_duplicates": 0,
         },
         "measured": measured,
         "evaluation": {
-            "threshold_to_alert": (
-                "insufficient_data" if alert_p95 is None
-                else "pass" if alert_p95 <= 15000 else "fail"
+            "collection_to_dashboard": evaluate("collection_to_dashboard", 10000),
+            "threshold_to_alert": evaluate("threshold_to_alert", 15000),
+            "collector_offline_detection": evaluate("collector_offline_detection", 60000),
+            "reconciliation_missing_sequences": (
+                "insufficient_data" if not rec_count else ("pass" if rec_max == 0 else "fail")
             ),
-            "collection_to_dashboard": (
-                "insufficient_data" if dashboard_p95 is None
-                else "pass" if dashboard_p95 <= 10000 else "fail"
-            ),
-            "collector_offline_detection": (
-                "insufficient_data" if offline_p95 is None
-                else "pass" if offline_p95 <= 60000 else "fail"
-            ),
-            "reconciliation_missing_sequences_p95": (
-                "insufficient_data" if reconciliation_p95 is None
-                else "pass" if reconciliation_p95 == 0 else "fail"
-            ),
-            "reconciliation_duplicate_protection": "enforced_by_unique_collector_sequence_constraint",
+            "reconciliation_duplicate_protection": "database_unique_constraint_enforced; duplicate_attempt_count_not_yet_measured",
         },
         "notes": [
-            "p95 is calculated from observed samples in the last 24 hours.",
-            "collection_to_dashboard measures source event timestamp to browser render acknowledgement receipt; client must send source_event_ts for the displayed data.",
-            "collector_offline_detection measures elapsed time from last heartbeat to watchdog detection.",
-            "reconciliation_missing_sequences stores the missing sequence count in delay_ms; despite the column name, this value is a count, not a duration.",
-            "A missing measurement is reported as insufficient_data, never as a passing SLO.",
+            "Latency is rendered_at minus source_event_ts; the acknowledgement receipt timestamp is retained separately.",
+            "Offline delay is watchdog detection time minus the last heartbeat timestamp.",
+            "Reconciliation sample values are missing-sequence counts, not milliseconds.",
+            "Duplicate attempts are rejected by the unique collector sequence constraint; an operational counter is not yet instrumented.",
         ],
     }
+
+
+class ThresholdUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    good: float = Field(ge=0)
+    fair: float = Field(ge=0)
+    poor: float = Field(ge=0)
+    hysteresis: float = Field(default=0.10, ge=0, le=0.5)
+
+
+@router.put("/thresholds/{metric}")
+async def update_thresholds(metric: str, payload: ThresholdUpdate, request: Request):
+    tenant = await require_role(request, {"tenant_admin"})
+    if not (payload.good < payload.fair < payload.poor):
+        raise HTTPException(422, detail={"code": "THRESHOLDS_MUST_BE_STRICTLY_INCREASING"})
+    async with request.app.state.db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.tenant_id',$1,true)", tenant)
+            await conn.execute(
+                """INSERT INTO thresholds(tenant_id,metric,good,fair,poor,hysteresis,updated_at)
+                   VALUES($1,$2,$3,$4,$5,$6,now())
+                   ON CONFLICT(tenant_id,metric) DO UPDATE
+                   SET good=EXCLUDED.good,fair=EXCLUDED.fair,poor=EXCLUDED.poor,
+                       hysteresis=EXCLUDED.hysteresis,updated_at=now()""",
+                tenant, metric, payload.good, payload.fair, payload.poor, payload.hysteresis,
+            )
+            await conn.execute(
+                """INSERT INTO audit_events
+                   (tenant_id,actor_id,action,resource_type,resource_id,details)
+                   VALUES($1,$2,'threshold.updated','threshold',$3,$4::jsonb)""",
+                tenant, str(request.state.user_id), metric,
+                json.dumps(payload.model_dump()),
+            )
+    return {"metric": metric, **payload.model_dump(), "updated": True}
